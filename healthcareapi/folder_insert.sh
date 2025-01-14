@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e -x
+set -e #-x
 
 [ $# -lt 1 ] && { echo "Usage: $0 [--single-study] <studyFolder>"; exit 1; }
 while :; do
@@ -20,14 +20,14 @@ BEARER_TOKEN=$(gcloud auth application-default print-access-token)
 MAX_PROCS=50
 
 waitDeleteStudy() {
-  local STUDY_UID=$1
+  local study_uid=$1
   # Try to delete the study and if it exists wait for the LRO to complete
-  local OPERATION=$(curl --silent --fail -X DELETE -H "Authorization: Bearer $BEARER_TOKEN" $DICOMWEB_HOST/$STUDY_UID | jq -r '.name')
-  if [ ! -z "$OPERATION" ]; then
-    printf "Waiting for delete LRO ${OPERATION}...\n"
+  local delete_op=$(curl --silent --fail -X DELETE -H "Authorization: Bearer $BEARER_TOKEN" $DICOMWEB_HOST/$study_uid | jq -r '.name')
+  if [ ! -z "$delete_op" ]; then
+    echo "Waiting for delete LRO $delete_op..."
     while true; do
-      local OPERATION_COMPLETE=$(curl --silent --fail -X GET -H "Authorization: Bearer $BEARER_TOKEN" $HCAPI_HOST/$OPERATION | jq -r '.done')
-      [ "$OPERATION_COMPLETE" == "true" ] && { break; }
+      local delete_op_status=$(curl --silent --fail -X GET -H "Authorization: Bearer $BEARER_TOKEN" $HCAPI_HOST/$delete_op | jq -r '.done')
+      [ "$delete_op_status" == "true" ] && { break; }
       sleep 5
     done
   fi
@@ -35,17 +35,22 @@ waitDeleteStudy() {
 
 if [ -z "$SINGLE_STUDY" ]; then
   # Find all the studyUIDs
-  printf "Finding all the studyUIDs in the folder...\n"
-  STUDY_UIDS=( $(find $FOLDER -name "*.dcm" | xargs --max-procs $MAX_PROCS -I @ sh -c 'dcm2json -B "@" | jq -r ".\"0020000D\".Value[0]"' | sort -u) )
-  for STUDY_UID in $STUDY_UIDS; do
-    printf "Deleting studyUID $STUDY_UID...\n"
-    waitDeleteStudy $STUDY_UID
+  echo "Finding all the studyUIDs in the folder..."
+  study_uids=( $(find $FOLDER -name "*.dcm" | xargs --max-procs $MAX_PROCS -I @ sh -c 'dcm2json -B "@" | jq -r ".\"0020000D\".Value[0]"' | sort -u) )
+  for study_uid in $study_uids; do
+    echo "Deleting studyUID $study_uid..."
+    waitDeleteStudy $study_uid
   done
 else
-  STUDY_UID=$(find $FOLDER -name "*.dcm" | head -1 | xargs -I @ sh -c 'dcm2json -B "@" | jq -r ".\"0020000D\".Value[0]"')
-  waitDeleteStudy $STUDY_UID
+  study_uid=$(find $FOLDER -name "*.dcm" | head -1 | xargs -I @ sh -c 'dcm2json -B "@" | jq -r ".\"0020000D\".Value[0]"')
+  echo "Deleting studyUID $study_uid..."
+  waitDeleteStudy $study_uid
 fi
 
 # Ingest all the studies in the folder
-printf "Ingesting studyUIDs ${STUDY_UIDS}...\n"
-time find $FOLDER -type f | xargs --max-procs $MAX_PROCS -I @ ./insert.sh "$BEARER_TOKEN" $DICOMWEB_HOST "@" > errcodes.txt 2> output.txt
+echo "Ingesting studyUID(s)..."
+INGEST_START_MS="$(date +%s%3N)"
+find $FOLDER -type f | xargs --max-procs $MAX_PROCS -I @ ./insert.sh "$BEARER_TOKEN" $DICOMWEB_HOST "@" > errcodes.txt
+echo "Received `wc -l errcodes.txt | awk '{print $1}'` responses in $[ $(date +%s%3N) - $INGEST_START_MS ]ms"
+echo "HTTP response codes:"
+sort -u errcodes.txt

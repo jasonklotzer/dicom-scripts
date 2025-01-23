@@ -2,22 +2,29 @@
 
 set -e #-x
 
-[ $# -lt 1 ] && { echo "Usage: $0 [--single-study] <studyFolder>"; exit 1; }
+[ $# -lt 2 ] && { echo "Usage: $0 [-s|--single-study] [-d|--skip-delete] [-u|--dicomstore-path <dicomStorePath>] [-p|--max-procs <numberOfThreads>] <dicomStorePath> <studyFolder>"; exit 1; }
 while :; do
     case $1 in
         -s|--single-study) SINGLE_STUDY=1
         ;;
-        *) FOLDER=$1; break;
+        -d|--skip-delete) SKIP_DELETE=1
+        ;;
+        -p|--max-procs) shift; MAX_PROCS=$1
+        ;;
+        *) DICOMSTORE_PATH=$1; shift; FOLDER=$1; break;
     esac
     shift
 done
 
-# TODO: Check for dcm2json, jq, curl
+# TODO: Check for dcm2bq, jq, curl
 
 HCAPI_HOST=https://healthcare.googleapis.com/v1
-DICOMWEB_HOST=${HCAPI_HOST}/projects/jklotzer-sandbox/locations/us/datasets/sandbox2/dicomStores/datastore1/dicomWeb/studies
-BEARER_TOKEN=$(gcloud auth application-default print-access-token)
-MAX_PROCS=50
+DICOMWEB_HOST="${HCAPI_HOST}/${DICOMSTORE_PATH}/dicomWeb/studies"
+BEARER_TOKEN="$(gcloud auth application-default print-access-token)"
+MAX_PROCS="${MAX_PROCS:-50}"
+ERR_CODES=errcodes.json
+
+echo "Using destination DICOMweb store $DICOMWEB_HOST"
 
 waitDeleteStudy() {
   local study_uid=$1
@@ -33,24 +40,27 @@ waitDeleteStudy() {
   fi
 }
 
-if [ -z "$SINGLE_STUDY" ]; then
-  # Find all the studyUIDs
-  echo "Finding all the studyUIDs in the folder..."
-  study_uids=( $(find $FOLDER -name "*.dcm" | xargs --max-procs $MAX_PROCS -I @ sh -c 'dcm2json -B "@" | jq -r ".\"0020000D\".Value[0]"' | sort -u) )
-  for study_uid in $study_uids; do
+if [ -z "$SKIP_DELETE" ]; then
+  if [ -z "$SINGLE_STUDY" ]; then
+    # Find all the studyUIDs
+    echo "Finding all the studyUIDs in the folder..."
+    study_uids=( $(find $FOLDER -name "*.dcm" | xargs --max-procs $MAX_PROCS -I @ sh -c 'dcm2bq dump "@" | jq -r ".StudyInstanceUID"' | sort -u) )
+    for study_uid in "${study_uids[@]}"; do
+      echo "Deleting studyUID $study_uid..."
+      waitDeleteStudy $study_uid
+    done
+  else
+    study_uid=$(find $FOLDER -name "*.dcm" | head -1 | xargs -I @ sh -c 'dcm2bq dump "@" | jq -r ".StudyInstanceUID"')
     echo "Deleting studyUID $study_uid..."
     waitDeleteStudy $study_uid
-  done
-else
-  study_uid=$(find $FOLDER -name "*.dcm" | head -1 | xargs -I @ sh -c 'dcm2json -B "@" | jq -r ".\"0020000D\".Value[0]"')
-  echo "Deleting studyUID $study_uid..."
-  waitDeleteStudy $study_uid
+  fi
 fi
 
 # Ingest all the studies in the folder
-echo "Ingesting studyUID(s)..."
+echo "Ingesting studyUID(s) with $MAX_PROCS processors..."
 INGEST_START_MS="$(date +%s%3N)"
-find $FOLDER -type f | xargs --max-procs $MAX_PROCS -I @ ./insert.sh "$BEARER_TOKEN" $DICOMWEB_HOST "@" > errcodes.txt
-echo "Received `wc -l errcodes.txt | awk '{print $1}'` responses in $[ $(date +%s%3N) - $INGEST_START_MS ]ms"
+find $FOLDER -type f | xargs --max-procs $MAX_PROCS -I @ ./insert.sh "$BEARER_TOKEN" $DICOMWEB_HOST "@" > $ERR_CODES
+echo "Received `wc -l $ERR_CODES | awk '{print $1}'` responses in $[ $(date +%s%3N) - $INGEST_START_MS ]ms"
 echo "HTTP response codes:"
-sort -u errcodes.txt
+jq --slurp '.[].code' $ERR_CODES | sort -u
+

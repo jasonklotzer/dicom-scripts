@@ -2,10 +2,16 @@
 
 DCMODIFY=dcmodify
 
+fail() {
+  printf >&2 "Error: $1\n"
+  exit 1
+}
+
+command -v $DCMODIFY >/dev/null 2>&1 || { fail "Command '$DCMODIFY' is required, but not installed."; }
+
 if [ $# -ne 4 ]
 then
-  echo "Usage : $0 inputfile outputdir #series #instances"
-  exit
+  fail "Usage: $0 inputfile outputdir #series #instances"
 fi
 
 INPUTFILE=$1
@@ -43,12 +49,5 @@ do
     $DCMODIFY -nb -gin -m "InstanceNumber=$i" $NEWFILE
   done
 done
-
-# Make a DICOMDIR
-#pushd $DIRECTORY 
-#dcmmkdir *
-#popd
-
-#zip -r study.zip $DIRECTORY
 
 rm $TMPFILE

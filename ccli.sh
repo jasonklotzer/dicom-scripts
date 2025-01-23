@@ -1,20 +1,25 @@
 #!/bin/bash
 
-[ $# -lt 2 ] && { echo "Usage: $0 dcmtk|dcm4che arguments"; exit 1; }
+fail() {
+  printf >&2 "Error: $1\n"
+  exit 1
+}
+
+command -v docker >/dev/null 2>&1 || { fail "Command 'docker' is required, but not installed."; }
+[ $# -lt 2 ] && { fail "Usage: $0 <dcmtk|dcm4che> [arguments]"; }
 
 IMAGE_ALIAS=$1
 
 case $IMAGE_ALIAS in
   dcmtk)
     IMAGE="imbio/dcmtk"
-    ;;
+  ;;
   dcm4che)
     IMAGE="dcm4che/dcm4che-tools"
-    ;;
+  ;;
   *)
-    echo "Image alias not defined: ${IMAGE_ALIAS}"
-    exit 1
-    ;;
+    fail "Image alias not defined: ${IMAGE_ALIAS}"
+  ;;
 esac
 
 shift # already processed image name

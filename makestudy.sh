@@ -8,11 +8,7 @@ fail() {
 }
 
 command -v $DCMODIFY >/dev/null 2>&1 || { fail "Command '$DCMODIFY' is required, but not installed."; }
-
-if [ $# -ne 4 ]
-then
-  fail "Usage: $0 inputfile outputdir #series #instances"
-fi
+[ $# -ne 4 ] && { fail "Usage: $0 <inputFile> <outputDir> <numOfSeries> <numOfInstances>"; }
 
 INPUTFILE=$1
 DIRECTORY=$2

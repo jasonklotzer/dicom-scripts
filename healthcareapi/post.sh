@@ -1,6 +1,11 @@
 #!/bin/bash
 
-[ $# -lt 3 ] && { echo "Usage: $0 <bearerToken> <dicomWebHost> <dcmFilePath>"; exit 1; }
+fail() {
+  printf >&2 "Error: $1\n"
+  exit 1
+}
+
+[ $# -ne 3 ] && { fail "Usage: $0 <bearerToken> <dicomWebHost> <dcmFilePath>"; }
 
 BEARER_TOKEN=$1
 DICOMWEB_HOST=$2

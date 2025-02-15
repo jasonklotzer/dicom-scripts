@@ -10,7 +10,11 @@ This repository contains a collection of bash scripts designed to streamline var
 
 * **`makestudy.sh`:** Generates a series of DICOM files with varying study and instance numbers, useful for testing and populating DICOM stores.
 
+* **`findstudies.sh`:** Search a PACS and create a JSON file with metadata for all the responses
+
 ### Google Cloud Healthcare API Integration
+
+* **`healthcareapi/deid/deid.sh`:** De-identify a set of DICOM files in GCS
 
 * **`healthcareapi/insert/insert_file.sh`:** Uploads a single DICOM file to a specified DICOM store using the Healthcare API.
 
@@ -24,12 +28,14 @@ This repository contains a collection of bash scripts designed to streamline var
     * Bash shell
     * Docker (for `ccli.sh`)
     * `dcmodify` (for `makestudy.sh`)
+    * `findscu` and `dcm2json` (for `findstudies.sh`)
 
 * **Healthcare API Scripts:**
     * Google Cloud Project with Healthcare API enabled
     * Service account with appropriate permissions
     * `gcloud` command-line tool
     * `curl` and `jq` (for JSON processing)
+    * `dcm2bq` (for `insert_folder.sh`)
 
 ## Usage
 

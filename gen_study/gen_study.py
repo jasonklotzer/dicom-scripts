@@ -578,15 +578,13 @@ if __name__ == "__main__":
         print("-" * 30)
 
 
-    if not args.quiet:
-        print(f"Generating {NUM_IMAGES} {chosen_modality_for_images} objects...")
-    first_instance_time_str = None
-    for i in range(NUM_IMAGES):
-        instance_num = i + 1
-        if not args.quiet:
-            print(f"  Creating Instance {instance_num}/{NUM_IMAGES}...")
-        ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
 
+    # --- Multiframe logic for US and XA ---
+    multiframes_modalities = ["US", "XA"]
+    if chosen_modality_for_images in multiframes_modalities:
+        if not args.quiet:
+            print(f"Generating 1 multiframe {chosen_modality_for_images} object with {NUM_IMAGES} frames...")
+        ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
         ds.PatientName = patient_name
         ds.PatientID = patient_id
         ds.AccessionNumber = accession_number
@@ -595,86 +593,67 @@ if __name__ == "__main__":
         ds.StudyTime = study_time_base
         ds.InstitutionName = institution_name
         ds.StudyDescription = study_description
-
         ds.SeriesInstanceUID = imaging_series_uid
         ds.SeriesNumber = overrides_dict.get('SeriesNumber', "1")
-        ds.InstanceNumber = str(instance_num)
+        ds.InstanceNumber = "1"
         ds.SOPInstanceUID = generate_uid()
-
-        # --- NEW: Set BodyPartExamined ---
-        if chosen_modality_for_images != "SR": # BodyPartExamined is typically for imaging modalities
-            if args.jumble_body_part:
-                # Pick a random body part from the plausible list for this study type
-                ds.BodyPartExamined = random.choice(body_part_options_for_study)
-                if not args.quiet:
-                    print(f"    Instance {instance_num} BodyPartExamined (jumbled): {ds.BodyPartExamined}")
-            else:
-                # Use the primary, consistent body part for the series
-                ds.BodyPartExamined = primary_body_part_examined
-            # This is set before overrides, so user can still override BodyPartExamined if they wish
-        # ==================================
-
-        instance_time = (datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S") +
-                         datetime.timedelta(seconds=i*0.5 + random.uniform(0, 0.2)))
-        current_time_str = instance_time.strftime("%H%M%S.%f")[:13]
-
-        ds.AcquisitionDateTime = study_date + current_time_str
-        ds.AcquisitionTime = current_time_str
+        # BodyPartExamined
+        if args.jumble_body_part:
+            ds.BodyPartExamined = random.choice(body_part_options_for_study)
+        else:
+            ds.BodyPartExamined = primary_body_part_examined
+        # Timing
+        first_instance_time_str = None
+        frame_times = []
+        for i in range(NUM_IMAGES):
+            instance_time = (datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S") +
+                             datetime.timedelta(seconds=i*0.5 + random.uniform(0, 0.2)))
+            current_time_str = instance_time.strftime("%H%M%S.%f")[:13]
+            frame_times.append(current_time_str)
+            if i == 0:
+                first_instance_time_str = current_time_str
+        ds.SeriesDate = study_date
+        ds.SeriesTime = first_instance_time_str
+        ds.AcquisitionDateTime = study_date + first_instance_time_str
+        ds.AcquisitionTime = first_instance_time_str
         ds.ContentDate = study_date
-        ds.ContentTime = current_time_str
-
-        if i == 0:
-            first_instance_time_str = current_time_str
-            ds.SeriesDate = study_date
-            ds.SeriesTime = first_instance_time_str
-        else:
-            ds.SeriesDate = study_date
-            ds.SeriesTime = first_instance_time_str
-
-
-        if chosen_modality_for_images in ["CT", "MR"]:
-             slice_pos = instance_num * 5.0 + random.uniform(-1.0, 1.0)
-             ds.SliceLocation = f"{slice_pos:.2f}"
-             ds.SliceThickness = "5.0"
-             ds.PixelSpacing = ["0.8", "0.8"]
-             ds.WindowCenter = "40"
-             ds.WindowWidth = "400"
-        elif chosen_modality_for_images in ["CR", "XA", "US"]:
-             try:
-                 center = (1 << (ds.BitsStored - 1))
-                 width = (1 << ds.BitsStored)
-                 ds.WindowCenter = f"{center:.0f}"
-                 ds.WindowWidth = f"{width:.0f}"
-             except AttributeError:
-                 pass
-
-
-        if args.generate_pixels:
-            try:
-                ds.PixelData = generate_plausible_pixel_data(ds, instance_num, quiet=args.quiet)
-            except Exception as pix_err:
-                 print(f"    ***ERROR*** generating pixel data for Instance {instance_num}: {pix_err}", file=sys.stderr)
-                 try:
-                     expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
-                     ds.PixelData = b'\x00' * expected_bytes
-                     if not args.quiet:
-                         print(f"    Falling back to zero bytes for PixelData.")
-                 except AttributeError:
-                     print(f"    ***WARNING*** Cannot calculate fallback zero bytes - missing attributes. PixelData will be empty.", file=sys.stderr)
-                     ds.PixelData = b''
-        else:
-            if not args.quiet:
-                print(f"    Skipping plausible pixel generation for Instance {instance_num}. Setting zero bytes.")
-            try:
-                expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
-                ds.PixelData = b'\x00' * expected_bytes
-            except AttributeError:
-                 print(f"    ***WARNING*** Instance {instance_num}: Could not calculate expected bytes for zero pixel data. PixelData may be missing.", file=sys.stderr)
-                 ds.PixelData = b''
-
-
+        ds.ContentTime = first_instance_time_str
+        # Windowing
+        try:
+            center = (1 << (ds.BitsStored - 1))
+            width = (1 << ds.BitsStored)
+            ds.WindowCenter = f"{center:.0f}"
+            ds.WindowWidth = f"{width:.0f}"
+        except AttributeError:
+            pass
+        # Generate all frames' pixel data
+        frame_bytes = []
+        for i in range(NUM_IMAGES):
+            if args.generate_pixels:
+                try:
+                    frame_bytes.append(generate_plausible_pixel_data(ds, i+1, quiet=args.quiet))
+                except Exception as pix_err:
+                    print(f"    ***ERROR*** generating pixel data for Frame {i+1}: {pix_err}", file=sys.stderr)
+                    try:
+                        expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                        frame_bytes.append(b'\x00' * expected_bytes)
+                        if not args.quiet:
+                            print(f"    Falling back to zero bytes for Frame {i+1}.")
+                    except AttributeError:
+                        print(f"    ***WARNING*** Cannot calculate fallback zero bytes - missing attributes. Frame will be empty.", file=sys.stderr)
+                        frame_bytes.append(b'')
+            else:
+                if not args.quiet:
+                    print(f"    Skipping plausible pixel generation for Frame {i+1}. Setting zero bytes.")
+                try:
+                    expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                    frame_bytes.append(b'\x00' * expected_bytes)
+                except AttributeError:
+                    print(f"    ***WARNING*** Frame {i+1}: Could not calculate expected bytes for zero pixel data. Frame will be empty.", file=sys.stderr)
+                    frame_bytes.append(b'')
+        ds.NumberOfFrames = str(NUM_IMAGES)
+        ds.PixelData = b''.join(frame_bytes)
         apply_overrides(ds, overrides_dict, quiet=args.quiet)
-
         ds.SOPInstanceUID = ds.SOPInstanceUID
         ds.SOPClassUID = imaging_sop_class_uid
         ds.Modality = chosen_modality_for_images
@@ -682,52 +661,163 @@ if __name__ == "__main__":
             if not args.quiet:
                 print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) after overrides.")
             ds.SpecificCharacterSet = DEFAULT_CHARACTER_SET
-
-
+        # PixelData length check
         try:
             if all(hasattr(ds, attr) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
-                if not all(isinstance(getattr(ds, attr), (int, float)) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
-                     raise TypeError("Pixel dimension attributes are not numeric")
-
-                expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel * NUM_IMAGES
                 if hasattr(ds, 'PixelData') and ds.PixelData is not None:
                     if len(ds.PixelData) != expected_bytes:
-                        print(f"    ***WARNING*** Instance {instance_num}: PixelData length mismatch after overrides!", file=sys.stderr)
+                        print(f"    ***WARNING*** Multiframe: PixelData length mismatch after overrides!", file=sys.stderr)
                         print(f"    Expected {expected_bytes}, got {len(ds.PixelData)}. Reverting to zero bytes.", file=sys.stderr)
                         ds.PixelData = b'\x00' * expected_bytes
                 else:
                     if not args.quiet:
-                        print(f"    PixelData missing or None after overrides for Instance {instance_num}. Setting zero bytes.")
+                        print(f"    PixelData missing or None after overrides for multiframe. Setting zero bytes.")
                     ds.PixelData = b'\x00' * expected_bytes
             elif hasattr(ds, 'PixelData') and ds.PixelData:
-                 print(f"    ***WARNING*** Instance {instance_num}: Cannot verify PixelData length due to missing dimension attributes after overrides.", file=sys.stderr)
-
+                print(f"    ***WARNING*** Multiframe: Cannot verify PixelData length due to missing dimension attributes after overrides.", file=sys.stderr)
         except (AttributeError, TypeError) as len_check_err:
-             print(f"    ***WARNING*** Instance {instance_num}: Error during PixelData length check: {len_check_err}. PixelData might be inconsistent.", file=sys.stderr)
-
-
+            print(f"    ***WARNING*** Multiframe: Error during PixelData length check: {len_check_err}. PixelData might be inconsistent.", file=sys.stderr)
         file_meta = create_file_meta()
         file_meta.MediaStorageSOPClassUID = imaging_sop_class_uid
         file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
-
         file_ds = pydicom.FileDataset(
             filename_or_obj=None, dataset=ds, file_meta=file_meta, preamble=b"\0" * 128
         )
-
         filename = study_output_path / f"{ds.Modality}_{ds.SOPInstanceUID}.dcm"
         if not args.quiet:
-            # Show BodyPartExamined in save message if it exists and not quiet
             bpe_info = f" (BPE: {ds.BodyPartExamined})" if hasattr(ds, "BodyPartExamined") and ds.BodyPartExamined else ""
             print(f"    Saving: {filename.name}{bpe_info}")
         try:
-             file_ds.save_as(filename, write_like_original=False)
+            file_ds.save_as(filename, write_like_original=False)
         except Exception as e:
-             print(f"    ***ERROR*** Failed to save file {filename.name}: {e}", file=sys.stderr)
-
-
-    if not args.quiet:
-        print(f"Finished generating {NUM_IMAGES} image objects.")
-        print("-" * 30)
+            print(f"    ***ERROR*** Failed to save file {filename.name}: {e}", file=sys.stderr)
+        if not args.quiet:
+            print(f"Finished generating 1 multiframe {chosen_modality_for_images} object.")
+            print("-" * 30)
+    else:
+        if not args.quiet:
+            print(f"Generating {NUM_IMAGES} {chosen_modality_for_images} objects...")
+        first_instance_time_str = None
+        for i in range(NUM_IMAGES):
+            instance_num = i + 1
+            if not args.quiet:
+                print(f"  Creating Instance {instance_num}/{NUM_IMAGES}...")
+            ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
+            ds.PatientName = patient_name
+            ds.PatientID = patient_id
+            ds.AccessionNumber = accession_number
+            ds.StudyInstanceUID = study_instance_uid
+            ds.StudyDate = study_date
+            ds.StudyTime = study_time_base
+            ds.InstitutionName = institution_name
+            ds.StudyDescription = study_description
+            ds.SeriesInstanceUID = imaging_series_uid
+            ds.SeriesNumber = overrides_dict.get('SeriesNumber', "1")
+            ds.InstanceNumber = str(instance_num)
+            ds.SOPInstanceUID = generate_uid()
+            # --- NEW: Set BodyPartExamined ---
+            if chosen_modality_for_images != "SR":
+                if args.jumble_body_part:
+                    ds.BodyPartExamined = random.choice(body_part_options_for_study)
+                    if not args.quiet:
+                        print(f"    Instance {instance_num} BodyPartExamined (jumbled): {ds.BodyPartExamined}")
+                else:
+                    ds.BodyPartExamined = primary_body_part_examined
+            instance_time = (datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S") +
+                             datetime.timedelta(seconds=i*0.5 + random.uniform(0, 0.2)))
+            current_time_str = instance_time.strftime("%H%M%S.%f")[:13]
+            ds.AcquisitionDateTime = study_date + current_time_str
+            ds.AcquisitionTime = current_time_str
+            ds.ContentDate = study_date
+            ds.ContentTime = current_time_str
+            if i == 0:
+                first_instance_time_str = current_time_str
+                ds.SeriesDate = study_date
+                ds.SeriesTime = first_instance_time_str
+            else:
+                ds.SeriesDate = study_date
+                ds.SeriesTime = first_instance_time_str
+            if chosen_modality_for_images in ["CT", "MR"]:
+                slice_pos = instance_num * 5.0 + random.uniform(-1.0, 1.0)
+                ds.SliceLocation = f"{slice_pos:.2f}"
+                ds.SliceThickness = "5.0"
+                ds.PixelSpacing = ["0.8", "0.8"]
+                ds.WindowCenter = "40"
+                ds.WindowWidth = "400"
+            elif chosen_modality_for_images in ["CR", "XA", "US"]:
+                try:
+                    center = (1 << (ds.BitsStored - 1))
+                    width = (1 << ds.BitsStored)
+                    ds.WindowCenter = f"{center:.0f}"
+                    ds.WindowWidth = f"{width:.0f}"
+                except AttributeError:
+                    pass
+            if args.generate_pixels:
+                try:
+                    ds.PixelData = generate_plausible_pixel_data(ds, instance_num, quiet=args.quiet)
+                except Exception as pix_err:
+                    print(f"    ***ERROR*** generating pixel data for Instance {instance_num}: {pix_err}", file=sys.stderr)
+                    try:
+                        expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                        ds.PixelData = b'\x00' * expected_bytes
+                        if not args.quiet:
+                            print(f"    Falling back to zero bytes for PixelData.")
+                    except AttributeError:
+                        print(f"    ***WARNING*** Cannot calculate fallback zero bytes - missing attributes. PixelData will be empty.", file=sys.stderr)
+                        ds.PixelData = b''
+            else:
+                if not args.quiet:
+                    print(f"    Skipping plausible pixel generation for Instance {instance_num}. Setting zero bytes.")
+                try:
+                    expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                    ds.PixelData = b'\x00' * expected_bytes
+                except AttributeError:
+                    print(f"    ***WARNING*** Instance {instance_num}: Could not calculate expected bytes for zero pixel data. PixelData may be missing.", file=sys.stderr)
+                    ds.PixelData = b''
+            apply_overrides(ds, overrides_dict, quiet=args.quiet)
+            ds.SOPInstanceUID = ds.SOPInstanceUID
+            ds.SOPClassUID = imaging_sop_class_uid
+            ds.Modality = chosen_modality_for_images
+            if not hasattr(ds, 'SpecificCharacterSet') or not ds.SpecificCharacterSet:
+                if not args.quiet:
+                    print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) after overrides.")
+                ds.SpecificCharacterSet = DEFAULT_CHARACTER_SET
+            try:
+                if all(hasattr(ds, attr) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
+                    if not all(isinstance(getattr(ds, attr), (int, float)) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
+                        raise TypeError("Pixel dimension attributes are not numeric")
+                    expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                    if hasattr(ds, 'PixelData') and ds.PixelData is not None:
+                        if len(ds.PixelData) != expected_bytes:
+                            print(f"    ***WARNING*** Instance {instance_num}: PixelData length mismatch after overrides!", file=sys.stderr)
+                            print(f"    Expected {expected_bytes}, got {len(ds.PixelData)}. Reverting to zero bytes.", file=sys.stderr)
+                            ds.PixelData = b'\x00' * expected_bytes
+                    else:
+                        if not args.quiet:
+                            print(f"    PixelData missing or None after overrides for Instance {instance_num}. Setting zero bytes.")
+                        ds.PixelData = b'\x00' * expected_bytes
+                elif hasattr(ds, 'PixelData') and ds.PixelData:
+                    print(f"    ***WARNING*** Instance {instance_num}: Cannot verify PixelData length due to missing dimension attributes after overrides.", file=sys.stderr)
+            except (AttributeError, TypeError) as len_check_err:
+                print(f"    ***WARNING*** Instance {instance_num}: Error during PixelData length check: {len_check_err}. PixelData might be inconsistent.", file=sys.stderr)
+            file_meta = create_file_meta()
+            file_meta.MediaStorageSOPClassUID = imaging_sop_class_uid
+            file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+            file_ds = pydicom.FileDataset(
+                filename_or_obj=None, dataset=ds, file_meta=file_meta, preamble=b"\0" * 128
+            )
+            filename = study_output_path / f"{ds.Modality}_{ds.SOPInstanceUID}.dcm"
+            if not args.quiet:
+                bpe_info = f" (BPE: {ds.BodyPartExamined})" if hasattr(ds, "BodyPartExamined") and ds.BodyPartExamined else ""
+                print(f"    Saving: {filename.name}{bpe_info}")
+            try:
+                file_ds.save_as(filename, write_like_original=False)
+            except Exception as e:
+                print(f"    ***ERROR*** Failed to save file {filename.name}: {e}", file=sys.stderr)
+        if not args.quiet:
+            print(f"Finished generating {NUM_IMAGES} image objects.")
+            print("-" * 30)
 
     # --- Generate the Structured Report (SR) Object ---
     # (SR generation remains largely unchanged, as BodyPartExamined is not typically part of the SR root dataset here)

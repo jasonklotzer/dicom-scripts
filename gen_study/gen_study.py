@@ -166,6 +166,47 @@ def generate_fake_report_text(fake, modality, study_description):
     report = report.replace("YYYY-MM-DD", fake.past_date(start_date="-2y").strftime("%Y-%m-%d"))
     return report
 
+def generate_patient_name_pn(fake: Faker) -> str:
+    """Generate a DICOM PN (Person Name) in the form LAST^FIRST.
+
+    Only two components are used as requested. Any caret characters from Faker are sanitized.
+    """
+    last = fake.last_name().strip().replace('^', ' ')
+    first = fake.first_name().strip().replace('^', ' ')
+    # Keep natural casing; DICOM PN doesn't require uppercase. Example shows LAST^FIRST.
+    return f"{last}^{first}"
+
+def random_dicom_date_within_last_100_years():
+    """Return a random DICOM DA (YYYYMMDD) within the last 100 years up to today."""
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=36525)  # ~100 years accounting for leap years
+    delta_days = (today - start).days
+    rand_days = random.randint(0, delta_days)
+    d = start + datetime.timedelta(days=rand_days)
+    return d.strftime("%Y%m%d")
+
+def random_dicom_birthdate_before(study_date_str):
+    """Return a random DICOM DA (YYYYMMDD) for PatientBirthDate not after the given StudyDate and within the prior 100 years.
+
+    If parsing fails, falls back to random_dicom_date_within_last_100_years().
+    """
+    try:
+        study_date = datetime.datetime.strptime(study_date_str, "%Y%m%d").date()
+    except Exception:
+        return random_dicom_date_within_last_100_years()
+
+    today = datetime.date.today()
+    end = min(study_date, today)
+    start = end - datetime.timedelta(days=36525)
+    if start < datetime.date(1900, 1, 1):
+        start = datetime.date(1900, 1, 1)
+    delta_days = (end - start).days
+    if delta_days <= 0:
+        return end.strftime("%Y%m%d")
+    rand_days = random.randint(0, delta_days)
+    d = start + datetime.timedelta(days=rand_days)
+    return d.strftime("%Y%m%d")
+
 def generate_plausible_pixel_data(ds, instance_num, quiet=False): # Added quiet flag
     """Generates plausible, modality-specific fake pixel data using NumPy."""
     # (Function remains unchanged internally, except for the print statement)
@@ -513,12 +554,15 @@ if __name__ == "__main__":
     # --- Generate Study-Level Consistent Data ---
     # UIDs and Identifiers
     study_instance_uid = overrides_dict.get('StudyInstanceUID', generate_uid())
-    patient_name = overrides_dict.get('PatientName', fake.name().replace(" ", "^")) # Basic PN format
+    patient_name = overrides_dict.get('PatientName', generate_patient_name_pn(fake))
     patient_id = overrides_dict.get('PatientID', generate_random_string(PATIENT_ID_LENGTH, string.digits))
     accession_number = overrides_dict.get('AccessionNumber', generate_random_string(ACCESSION_NUMBER_LENGTH))
     institution_name = overrides_dict.get('InstitutionName', fake.company() + " " + random.choice(["Medical Center", "Hospital", "Clinic", "Imaging"]))
-    study_date = overrides_dict.get('StudyDate', datetime.date.today().strftime("%Y%m%d"))
+    study_date = overrides_dict.get('StudyDate', random_dicom_date_within_last_100_years())
     study_time_base = overrides_dict.get('StudyTime', datetime.datetime.now().strftime("%H%M%S"))
+
+    # Patient birth date: random within last 100 years, not after StudyDate (unless overridden)
+    patient_birth_date = overrides_dict.get('PatientBirthDate', random_dicom_birthdate_before(study_date))
 
     # --- Choose Imaging Modality for the Study ---
     chosen_modality = overrides_dict.get('Modality', random.choice(IMAGING_MODALITIES))
@@ -587,6 +631,7 @@ if __name__ == "__main__":
         ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
         ds.PatientName = patient_name
         ds.PatientID = patient_id
+        ds.PatientBirthDate = patient_birth_date
         ds.AccessionNumber = accession_number
         ds.StudyInstanceUID = study_instance_uid
         ds.StudyDate = study_date
@@ -706,6 +751,7 @@ if __name__ == "__main__":
             ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
             ds.PatientName = patient_name
             ds.PatientID = patient_id
+            ds.PatientBirthDate = patient_birth_date
             ds.AccessionNumber = accession_number
             ds.StudyInstanceUID = study_instance_uid
             ds.StudyDate = study_date
@@ -828,6 +874,7 @@ if __name__ == "__main__":
 
     ds_sr.PatientName = patient_name
     ds_sr.PatientID = patient_id
+    ds_sr.PatientBirthDate = patient_birth_date
     ds_sr.AccessionNumber = accession_number
     ds_sr.StudyInstanceUID = study_instance_uid
     ds_sr.StudyDate = study_date

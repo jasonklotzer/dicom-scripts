@@ -527,6 +527,12 @@ if __name__ == "__main__":
         dest='jumble_body_part',
         help='If set, BodyPartExamined will vary (plausibly) for each instance within the series. Otherwise, it is consistent.'
     )
+    parser.add_argument(
+        '--num-studies',
+        type=int,
+        default=1,
+        help='Number of studies to generate (default: 1)'
+    )
     args = parser.parse_args()
     overrides_dict = {item[0]: item[1] for item in args.overrides} if args.overrides else {}
 
@@ -551,208 +557,136 @@ if __name__ == "__main__":
 
     fake = Faker() # Initialize Faker
 
-    # --- Generate Study-Level Consistent Data ---
-    # UIDs and Identifiers
-    study_instance_uid = overrides_dict.get('StudyInstanceUID', generate_uid())
-    patient_name = overrides_dict.get('PatientName', generate_patient_name_pn(fake))
-    patient_id = overrides_dict.get('PatientID', generate_random_string(PATIENT_ID_LENGTH, string.digits))
-    accession_number = overrides_dict.get('AccessionNumber', generate_random_string(ACCESSION_NUMBER_LENGTH))
-    institution_name = overrides_dict.get('InstitutionName', fake.company() + " " + random.choice(["Medical Center", "Hospital", "Clinic", "Imaging"]))
-    study_date = overrides_dict.get('StudyDate', random_dicom_date_within_last_100_years())
-    study_time_base = overrides_dict.get('StudyTime', datetime.datetime.now().strftime("%H%M%S"))
+    # --- Generate Multiple Studies ---
+    for study_num in range(args.num_studies):
+        if args.num_studies > 1 and not args.quiet:
+            print(f"\n{'='*50}")
+            print(f"GENERATING STUDY {study_num + 1} OF {args.num_studies}")
+            print(f"{'='*50}")
 
-    # Patient birth date: random within last 100 years, not after StudyDate (unless overridden)
-    patient_birth_date = overrides_dict.get('PatientBirthDate', random_dicom_birthdate_before(study_date))
-
-    # --- Choose Imaging Modality for the Study ---
-    chosen_modality = overrides_dict.get('Modality', random.choice(IMAGING_MODALITIES))
-    if chosen_modality not in SOP_CLASS_UIDS or chosen_modality == "SR":
-         print(f"Warning: Invalid/non-imaging modality '{chosen_modality}' selected or specified. Defaulting imaging component to CT.", file=sys.stderr) # Warning to stderr
-         chosen_modality_for_images = "CT"
-    else:
-         chosen_modality_for_images = chosen_modality
-    imaging_sop_class_uid = SOP_CLASS_UIDS[chosen_modality_for_images]
-
-    # Generate Study Description based on modality
-    possible_descriptions = MODALITY_DESCRIPTIONS.get(chosen_modality_for_images, MODALITY_DESCRIPTIONS['DEFAULT'])
-    study_description = overrides_dict.get('StudyDescription', random.choice(possible_descriptions))
-
-    # --- NEW: Determine BodyPartExamined for the series ---
-    # Get the list of possible body parts for this study description and modality
-    body_part_options_for_study = get_body_part_options(study_description, chosen_modality_for_images, quiet=args.quiet)
-    # The primary body part is the first in the list (used if not jumbling)
-    primary_body_part_examined = body_part_options_for_study[0]
-    # If jumbling, we'll pick from body_part_options_for_study for each instance.
-
-    if not args.quiet:
-        print(f"Generating a {chosen_modality_for_images} study with 1 SR report.")
-        print(f"Institution: {institution_name}")
-        print(f"Study Description: {study_description}")
-        print(f"Primary BodyPartExamined for series: {primary_body_part_examined}")
-        if args.jumble_body_part:
-            print(f"  (Jumbling active, will pick from: {body_part_options_for_study})")
-
-
-    # --- Generate Series UIDs ---
-    imaging_series_uid = overrides_dict.get('SeriesInstanceUID', generate_uid())
-    sr_series_uid_default = generate_uid()
-    sr_series_uid = overrides_dict.get('SeriesInstanceUID_SR', overrides_dict.get('SeriesInstanceUID', sr_series_uid_default))
-
-    if not args.quiet:
-        print("-" * 30)
-        print(f"Study Instance UID: {study_instance_uid}")
-        print(f"Patient ID:         {patient_id}")
-        print(f"Patient Name:       {patient_name}")
-        print(f"Accession Number:   {accession_number}")
-        print(f"Imaging Series UID: {imaging_series_uid}")
-        print(f"SR Series UID:      {sr_series_uid}")
-        print("-" * 30)
-
-
-    study_output_path = Path(args.base_dir) / study_instance_uid
-    try:
-        study_output_path.mkdir(parents=True, exist_ok=True)
-        if not args.quiet:
-            print(f"Output directory for this study: {study_output_path.resolve()}")
-    except OSError as e:
-        print(f"Error creating output directory {study_output_path}: {e}", file=sys.stderr)
-        print("Please check permissions and path validity.", file=sys.stderr)
-        sys.exit(1)
-    if not args.quiet:
-        print("-" * 30)
-
-
-
-    # --- Multiframe logic for US and XA ---
-    multiframes_modalities = ["US", "XA"]
-    if chosen_modality_for_images in multiframes_modalities:
-        if not args.quiet:
-            print(f"Generating 1 multiframe {chosen_modality_for_images} object with {NUM_IMAGES} frames...")
-        ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
-        ds.PatientName = patient_name
-        ds.PatientID = patient_id
-        ds.PatientBirthDate = patient_birth_date
-        ds.AccessionNumber = accession_number
-        ds.StudyInstanceUID = study_instance_uid
-        ds.StudyDate = study_date
-        ds.StudyTime = study_time_base
-        ds.InstitutionName = institution_name
-        ds.StudyDescription = study_description
-        ds.SeriesInstanceUID = imaging_series_uid
-        ds.SeriesNumber = overrides_dict.get('SeriesNumber', "1")
-        ds.InstanceNumber = "1"
-        ds.SOPInstanceUID = generate_uid()
-        # BodyPartExamined
-        if args.jumble_body_part:
-            ds.BodyPartExamined = random.choice(body_part_options_for_study)
+        # --- Generate Study-Level Consistent Data ---
+        # UIDs and Identifiers (generate new values for each study unless specifically overridden)
+        if 'StudyInstanceUID' in overrides_dict:
+            study_instance_uid = overrides_dict['StudyInstanceUID']
         else:
-            ds.BodyPartExamined = primary_body_part_examined
-        # Timing
-        first_instance_time_str = None
-        frame_times = []
-        for i in range(NUM_IMAGES):
-            instance_time = (datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S") +
-                             datetime.timedelta(seconds=i*0.5 + random.uniform(0, 0.2)))
-            current_time_str = instance_time.strftime("%H%M%S.%f")[:13]
-            frame_times.append(current_time_str)
-            if i == 0:
-                first_instance_time_str = current_time_str
-        ds.SeriesDate = study_date
-        ds.SeriesTime = first_instance_time_str
-        ds.AcquisitionDateTime = study_date + first_instance_time_str
-        ds.AcquisitionTime = first_instance_time_str
-        ds.ContentDate = study_date
-        ds.ContentTime = first_instance_time_str
-        # Windowing
-        try:
-            center = (1 << (ds.BitsStored - 1))
-            width = (1 << ds.BitsStored)
-            ds.WindowCenter = f"{center:.0f}"
-            ds.WindowWidth = f"{width:.0f}"
-        except AttributeError:
-            pass
-        # Generate all frames' pixel data
-        frame_bytes = []
-        for i in range(NUM_IMAGES):
-            if args.generate_pixels:
-                try:
-                    frame_bytes.append(generate_plausible_pixel_data(ds, i+1, quiet=args.quiet))
-                except Exception as pix_err:
-                    print(f"    ***ERROR*** generating pixel data for Frame {i+1}: {pix_err}", file=sys.stderr)
-                    try:
-                        expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
-                        frame_bytes.append(b'\x00' * expected_bytes)
-                        if not args.quiet:
-                            print(f"    Falling back to zero bytes for Frame {i+1}.")
-                    except AttributeError:
-                        print(f"    ***WARNING*** Cannot calculate fallback zero bytes - missing attributes. Frame will be empty.", file=sys.stderr)
-                        frame_bytes.append(b'')
-            else:
-                if not args.quiet:
-                    print(f"    Skipping plausible pixel generation for Frame {i+1}. Setting zero bytes.")
-                try:
-                    expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
-                    frame_bytes.append(b'\x00' * expected_bytes)
-                except AttributeError:
-                    print(f"    ***WARNING*** Frame {i+1}: Could not calculate expected bytes for zero pixel data. Frame will be empty.", file=sys.stderr)
-                    frame_bytes.append(b'')
-        ds.NumberOfFrames = str(NUM_IMAGES)
-        ds.PixelData = b''.join(frame_bytes)
-        apply_overrides(ds, overrides_dict, quiet=args.quiet)
-        ds.SOPInstanceUID = ds.SOPInstanceUID
-        ds.SOPClassUID = imaging_sop_class_uid
-        ds.Modality = chosen_modality_for_images
-        if not hasattr(ds, 'SpecificCharacterSet') or not ds.SpecificCharacterSet:
-            if not args.quiet:
-                print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) after overrides.")
-            ds.SpecificCharacterSet = DEFAULT_CHARACTER_SET
-        # PixelData length check
-        try:
-            if all(hasattr(ds, attr) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
-                expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel * NUM_IMAGES
-                if hasattr(ds, 'PixelData') and ds.PixelData is not None:
-                    if len(ds.PixelData) != expected_bytes:
-                        print(f"    ***WARNING*** Multiframe: PixelData length mismatch after overrides!", file=sys.stderr)
-                        print(f"    Expected {expected_bytes}, got {len(ds.PixelData)}. Reverting to zero bytes.", file=sys.stderr)
-                        ds.PixelData = b'\x00' * expected_bytes
-                else:
-                    if not args.quiet:
-                        print(f"    PixelData missing or None after overrides for multiframe. Setting zero bytes.")
-                    ds.PixelData = b'\x00' * expected_bytes
-            elif hasattr(ds, 'PixelData') and ds.PixelData:
-                print(f"    ***WARNING*** Multiframe: Cannot verify PixelData length due to missing dimension attributes after overrides.", file=sys.stderr)
-        except (AttributeError, TypeError) as len_check_err:
-            print(f"    ***WARNING*** Multiframe: Error during PixelData length check: {len_check_err}. PixelData might be inconsistent.", file=sys.stderr)
-        file_meta = create_file_meta()
-        file_meta.MediaStorageSOPClassUID = imaging_sop_class_uid
-        file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
-        file_ds = pydicom.FileDataset(
-            filename_or_obj=None, dataset=ds, file_meta=file_meta, preamble=b"\0" * 128
-        )
-        filename = study_output_path / f"{ds.Modality}_{ds.SOPInstanceUID}.dcm"
+            study_instance_uid = generate_uid()
+            
+        if 'PatientName' in overrides_dict:
+            patient_name = overrides_dict['PatientName']
+        else:
+            patient_name = generate_patient_name_pn(fake)
+            
+        if 'PatientID' in overrides_dict:
+            patient_id = overrides_dict['PatientID']
+        else:
+            patient_id = generate_random_string(PATIENT_ID_LENGTH, string.digits)
+            
+        if 'AccessionNumber' in overrides_dict:
+            accession_number = overrides_dict['AccessionNumber']
+        else:
+            accession_number = generate_random_string(ACCESSION_NUMBER_LENGTH)
+            
+        if 'InstitutionName' in overrides_dict:
+            institution_name = overrides_dict['InstitutionName']
+        else:
+            institution_name = fake.company() + " " + random.choice(["Medical Center", "Hospital", "Clinic", "Imaging"])
+            
+        if 'StudyDate' in overrides_dict:
+            study_date = overrides_dict['StudyDate']
+        else:
+            study_date = random_dicom_date_within_last_100_years()
+            
+        if 'StudyTime' in overrides_dict:
+            study_time_base = overrides_dict['StudyTime']
+        else:
+            study_time_base = datetime.datetime.now().strftime("%H%M%S")
+
+        # Patient birth date: random within last 100 years, not after StudyDate (unless overridden)
+        if 'PatientBirthDate' in overrides_dict:
+            patient_birth_date = overrides_dict['PatientBirthDate']
+        else:
+            patient_birth_date = random_dicom_birthdate_before(study_date)
+
+        # --- Choose Imaging Modality for the Study ---
+        if 'Modality' in overrides_dict:
+            chosen_modality = overrides_dict['Modality']
+        else:
+            chosen_modality = random.choice(IMAGING_MODALITIES)
+            
+        if chosen_modality not in SOP_CLASS_UIDS or chosen_modality == "SR":
+             print(f"Warning: Invalid/non-imaging modality '{chosen_modality}' selected or specified. Defaulting imaging component to CT.", file=sys.stderr) # Warning to stderr
+             chosen_modality_for_images = "CT"
+        else:
+             chosen_modality_for_images = chosen_modality
+        imaging_sop_class_uid = SOP_CLASS_UIDS[chosen_modality_for_images]
+
+        # Generate Study Description based on modality
+        possible_descriptions = MODALITY_DESCRIPTIONS.get(chosen_modality_for_images, MODALITY_DESCRIPTIONS['DEFAULT'])
+        if 'StudyDescription' in overrides_dict:
+            study_description = overrides_dict['StudyDescription']
+        else:
+            study_description = random.choice(possible_descriptions)
+
+        # --- NEW: Determine BodyPartExamined for the series ---
+        # Get the list of possible body parts for this study description and modality
+        body_part_options_for_study = get_body_part_options(study_description, chosen_modality_for_images, quiet=args.quiet)
+        # The primary body part is the first in the list (used if not jumbling)
+        primary_body_part_examined = body_part_options_for_study[0]
+        # If jumbling, we'll pick from body_part_options_for_study for each instance.
+
         if not args.quiet:
-            bpe_info = f" (BPE: {ds.BodyPartExamined})" if hasattr(ds, "BodyPartExamined") and ds.BodyPartExamined else ""
-            print(f"    Saving: {filename.name}{bpe_info}")
-        try:
-            file_ds.save_as(filename, write_like_original=False)
-        except Exception as e:
-            print(f"    ***ERROR*** Failed to save file {filename.name}: {e}", file=sys.stderr)
+            print(f"Generating a {chosen_modality_for_images} study with 1 SR report.")
+            print(f"Institution: {institution_name}")
+            print(f"Study Description: {study_description}")
+            print(f"Primary BodyPartExamined for series: {primary_body_part_examined}")
+            if args.jumble_body_part:
+                print(f"  (Jumbling active, will pick from: {body_part_options_for_study})")
+
+        # --- Generate Series UIDs ---
+        if 'SeriesInstanceUID' in overrides_dict:
+            imaging_series_uid = overrides_dict['SeriesInstanceUID']
+        else:
+            imaging_series_uid = generate_uid()
+            
+        sr_series_uid_default = generate_uid()
+        if 'SeriesInstanceUID_SR' in overrides_dict:
+            sr_series_uid = overrides_dict['SeriesInstanceUID_SR']
+        elif 'SeriesInstanceUID' in overrides_dict:
+            sr_series_uid = overrides_dict['SeriesInstanceUID']
+        else:
+            sr_series_uid = sr_series_uid_default
+
         if not args.quiet:
-            print(f"Finished generating 1 multiframe {chosen_modality_for_images} object.")
             print("-" * 30)
-    else:
-        if not args.quiet:
-            print(f"Generating {NUM_IMAGES} {chosen_modality_for_images} objects...")
-        first_instance_time_str = None
-        for i in range(NUM_IMAGES):
-            instance_num = i + 1
+            print(f"Study Instance UID: {study_instance_uid}")
+            print(f"Patient ID:         {patient_id}")
+            print(f"Patient Name:       {patient_name}")
+            print(f"Accession Number:   {accession_number}")
+            print(f"Imaging Series UID: {imaging_series_uid}")
+            print(f"SR Series UID:      {sr_series_uid}")
+            print("-" * 30)
+
+        study_output_path = Path(args.base_dir) / study_instance_uid
+        try:
+            study_output_path.mkdir(parents=True, exist_ok=True)
             if not args.quiet:
-                print(f"  Creating Instance {instance_num}/{NUM_IMAGES}...")
+                print(f"Output directory for this study: {study_output_path.resolve()}")
+        except OSError as e:
+            print(f"Error creating output directory {study_output_path}: {e}", file=sys.stderr)
+            print("Please check permissions and path validity.", file=sys.stderr)
+            sys.exit(1)
+        if not args.quiet:
+            print("-" * 30)
+
+        # --- Multiframe logic for US and XA ---
+        multiframes_modalities = ["US", "XA"]
+        if chosen_modality_for_images in multiframes_modalities:
+            if not args.quiet:
+                print(f"Generating 1 multiframe {chosen_modality_for_images} object with {NUM_IMAGES} frames...")
             ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
             ds.PatientName = patient_name
             ds.PatientID = patient_id
             ds.PatientBirthDate = patient_birth_date
-            ds.AccessionNumber = accession_number
             ds.StudyInstanceUID = study_instance_uid
             ds.StudyDate = study_date
             ds.StudyTime = study_time_base
@@ -760,30 +694,152 @@ if __name__ == "__main__":
             ds.StudyDescription = study_description
             ds.SeriesInstanceUID = imaging_series_uid
             ds.SeriesNumber = overrides_dict.get('SeriesNumber', "1")
-            ds.InstanceNumber = str(instance_num)
+            ds.InstanceNumber = "1"
             ds.SOPInstanceUID = generate_uid()
-            # --- NEW: Set BodyPartExamined ---
-            if chosen_modality_for_images != "SR":
-                if args.jumble_body_part:
-                    ds.BodyPartExamined = random.choice(body_part_options_for_study)
-                    if not args.quiet:
-                        print(f"    Instance {instance_num} BodyPartExamined (jumbled): {ds.BodyPartExamined}")
-                else:
-                    ds.BodyPartExamined = primary_body_part_examined
-            instance_time = (datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S") +
-                             datetime.timedelta(seconds=i*0.5 + random.uniform(0, 0.2)))
-            current_time_str = instance_time.strftime("%H%M%S.%f")[:13]
-            ds.AcquisitionDateTime = study_date + current_time_str
-            ds.AcquisitionTime = current_time_str
-            ds.ContentDate = study_date
-            ds.ContentTime = current_time_str
-            if i == 0:
-                first_instance_time_str = current_time_str
-                ds.SeriesDate = study_date
-                ds.SeriesTime = first_instance_time_str
+            # BodyPartExamined
+            if args.jumble_body_part:
+                ds.BodyPartExamined = random.choice(body_part_options_for_study)
             else:
-                ds.SeriesDate = study_date
-                ds.SeriesTime = first_instance_time_str
+                ds.BodyPartExamined = primary_body_part_examined
+            # Timing
+            first_instance_time_str = None
+            frame_times = []
+            for i in range(NUM_IMAGES):
+                instance_time = (datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S") +
+                                 datetime.timedelta(seconds=i*0.5 + random.uniform(0, 0.2)))
+                current_time_str = instance_time.strftime("%H%M%S.%f")[:13]
+                frame_times.append(current_time_str)
+                if i == 0:
+                    first_instance_time_str = current_time_str
+            ds.SeriesDate = study_date
+            ds.SeriesTime = first_instance_time_str
+            ds.AcquisitionDateTime = study_date + first_instance_time_str
+            ds.AcquisitionTime = first_instance_time_str
+            ds.ContentDate = study_date
+            ds.ContentTime = first_instance_time_str
+            # Windowing
+            try:
+                center = (1 << (ds.BitsStored - 1))
+                width = (1 << ds.BitsStored)
+                ds.WindowCenter = f"{center:.0f}"
+                ds.WindowWidth = f"{width:.0f}"
+            except AttributeError:
+                pass
+            # Generate all frames' pixel data
+            frame_bytes = []
+            for i in range(NUM_IMAGES):
+                if args.generate_pixels:
+                    try:
+                        frame_bytes.append(generate_plausible_pixel_data(ds, i+1, quiet=args.quiet))
+                    except Exception as pix_err:
+                        print(f"    ***ERROR*** generating pixel data for Frame {i+1}: {pix_err}", file=sys.stderr)
+                        try:
+                            expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                            frame_bytes.append(b'\x00' * expected_bytes)
+                            if not args.quiet:
+                                print(f"    Falling back to zero bytes for Frame {i+1}.")
+                        except AttributeError:
+                            print(f"    ***WARNING*** Cannot calculate fallback zero bytes - missing attributes. Frame will be empty.", file=sys.stderr)
+                            frame_bytes.append(b'')
+                else:
+                    if not args.quiet:
+                        print(f"    Skipping plausible pixel generation for Frame {i+1}. Setting zero bytes.")
+                    try:
+                        expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                        frame_bytes.append(b'\x00' * expected_bytes)
+                    except AttributeError:
+                        print(f"    ***WARNING*** Frame {i+1}: Could not calculate expected bytes for zero pixel data. Frame will be empty.", file=sys.stderr)
+                        frame_bytes.append(b'')
+            ds.NumberOfFrames = str(NUM_IMAGES)
+            ds.PixelData = b''.join(frame_bytes)
+            apply_overrides(ds, overrides_dict, quiet=args.quiet)
+            ds.SOPInstanceUID = ds.SOPInstanceUID
+            ds.SOPClassUID = imaging_sop_class_uid
+            ds.Modality = chosen_modality_for_images
+            if not hasattr(ds, 'SpecificCharacterSet') or not ds.SpecificCharacterSet:
+                if not args.quiet:
+                    print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) after overrides.")
+                ds.SpecificCharacterSet = DEFAULT_CHARACTER_SET
+            # PixelData length check
+            try:
+                if all(hasattr(ds, attr) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
+                    expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel * NUM_IMAGES
+                    if hasattr(ds, 'PixelData') and ds.PixelData is not None:
+                        if len(ds.PixelData) != expected_bytes:
+                            print(f"    ***WARNING*** Multiframe: PixelData length mismatch after overrides!", file=sys.stderr)
+                            print(f"    Expected {expected_bytes}, got {len(ds.PixelData)}. Reverting to zero bytes.", file=sys.stderr)
+                            ds.PixelData = b'\x00' * expected_bytes
+                    else:
+                        if not args.quiet:
+                            print(f"    PixelData missing or None after overrides for multiframe. Setting zero bytes.")
+                        ds.PixelData = b'\x00' * expected_bytes
+                elif hasattr(ds, 'PixelData') and ds.PixelData:
+                    print(f"    ***WARNING*** Multiframe: Cannot verify PixelData length due to missing dimension attributes after overrides.", file=sys.stderr)
+            except (AttributeError, TypeError) as len_check_err:
+                print(f"    ***WARNING*** Multiframe: Error during PixelData length check: {len_check_err}. PixelData might be inconsistent.", file=sys.stderr)
+            file_meta = create_file_meta()
+            file_meta.MediaStorageSOPClassUID = imaging_sop_class_uid
+            file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+            file_ds = pydicom.FileDataset(
+                filename_or_obj=None, dataset=ds, file_meta=file_meta, preamble=b"\0" * 128
+            )
+            filename = study_output_path / f"{ds.Modality}_{ds.SOPInstanceUID}.dcm"
+            if not args.quiet:
+                bpe_info = f" (BPE: {ds.BodyPartExamined})" if hasattr(ds, "BodyPartExamined") and ds.BodyPartExamined else ""
+                print(f"    Saving: {filename.name}{bpe_info}")
+            try:
+                file_ds.save_as(filename, write_like_original=False)
+            except Exception as e:
+                print(f"    ***ERROR*** Failed to save file {filename.name}: {e}", file=sys.stderr)
+            if not args.quiet:
+                print(f"Finished generating 1 multiframe {chosen_modality_for_images} object.")
+                print("-" * 30)
+
+        else:
+            # --- Standard (non-multiframe) logic for other modalities ---
+            if not args.quiet:
+                print(f"Generating {NUM_IMAGES} {chosen_modality_for_images} objects...")
+            first_instance_time_str = None
+            for i in range(NUM_IMAGES):
+                instance_num = i + 1
+                if not args.quiet:
+                    print(f"  Creating Instance {instance_num}/{NUM_IMAGES}...")
+                ds = create_basic_dicom_dataset(chosen_modality_for_images, imaging_sop_class_uid)
+                ds.PatientName = patient_name
+                ds.PatientID = patient_id
+                ds.PatientBirthDate = patient_birth_date
+                ds.AccessionNumber = accession_number
+                ds.StudyInstanceUID = study_instance_uid
+                ds.StudyDate = study_date
+                ds.StudyTime = study_time_base
+                ds.InstitutionName = institution_name
+                ds.StudyDescription = study_description
+                ds.SeriesInstanceUID = imaging_series_uid
+                ds.SeriesNumber = overrides_dict.get('SeriesNumber', "1")
+                ds.InstanceNumber = str(instance_num)
+                ds.SOPInstanceUID = generate_uid()
+                # --- NEW: Set BodyPartExamined ---
+                if chosen_modality_for_images != "SR":
+                    if args.jumble_body_part:
+                        ds.BodyPartExamined = random.choice(body_part_options_for_study)
+                        if not args.quiet:
+                            print(f"    Instance {instance_num} BodyPartExamined (jumbled): {ds.BodyPartExamined}")
+                    else:
+                        ds.BodyPartExamined = primary_body_part_examined
+                instance_time = (datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S") +
+                                 datetime.timedelta(seconds=i*0.5 + random.uniform(0, 0.2)))
+                current_time_str = instance_time.strftime("%H%M%S.%f")[:13]
+                ds.AcquisitionDateTime = study_date + current_time_str
+                ds.AcquisitionTime = current_time_str
+                ds.ContentDate = study_date
+                ds.ContentTime = current_time_str
+                if i == 0:
+                    first_instance_time_str = current_time_str
+                    ds.SeriesDate = study_date
+                    ds.SeriesTime = first_instance_time_str
+                else:
+                    ds.SeriesDate = study_date
+                    ds.SeriesTime = first_instance_time_str
             if chosen_modality_for_images in ["CT", "MR"]:
                 slice_pos = instance_num * 5.0 + random.uniform(-1.0, 1.0)
                 ds.SliceLocation = f"{slice_pos:.2f}"
@@ -865,109 +921,108 @@ if __name__ == "__main__":
             print(f"Finished generating {NUM_IMAGES} image objects.")
             print("-" * 30)
 
-    # --- Generate the Structured Report (SR) Object ---
-    # (SR generation remains largely unchanged, as BodyPartExamined is not typically part of the SR root dataset here)
-    if not args.quiet:
-        print("Generating SR object...")
-    sr_sop_class_uid = SOP_CLASS_UIDS["SR"]
-    ds_sr = create_basic_dicom_dataset("SR", sr_sop_class_uid)
+        # --- Generate the Structured Report (SR) Object ---
+        # (SR generation remains largely unchanged, as BodyPartExamined is not typically part of the SR root dataset here)
+        if not args.quiet:
+            print("Generating SR object...")
+        sr_sop_class_uid = SOP_CLASS_UIDS["SR"]
+        ds_sr = create_basic_dicom_dataset("SR", sr_sop_class_uid)
 
-    ds_sr.PatientName = patient_name
-    ds_sr.PatientID = patient_id
-    ds_sr.PatientBirthDate = patient_birth_date
-    ds_sr.AccessionNumber = accession_number
-    ds_sr.StudyInstanceUID = study_instance_uid
-    ds_sr.StudyDate = study_date
-    ds_sr.StudyTime = study_time_base
-    ds_sr.InstitutionName = institution_name
-    ds_sr.StudyDescription = study_description
+        ds_sr.PatientName = patient_name
+        ds_sr.PatientID = patient_id
+        ds_sr.PatientBirthDate = patient_birth_date
+        ds_sr.AccessionNumber = accession_number
+        ds_sr.StudyInstanceUID = study_instance_uid
+        ds_sr.StudyDate = study_date
+        ds_sr.StudyTime = study_time_base
+        ds_sr.InstitutionName = institution_name
+        ds_sr.StudyDescription = study_description
 
-    ds_sr.SeriesInstanceUID = sr_series_uid
-    ds_sr.SeriesNumber = overrides_dict.get('SeriesNumber_SR', overrides_dict.get('SeriesNumber', "99"))
-    ds_sr.InstanceNumber = "1"
-    ds_sr.SOPInstanceUID = generate_uid()
+        ds_sr.SeriesInstanceUID = sr_series_uid
+        ds_sr.SeriesNumber = overrides_dict.get('SeriesNumber_SR', overrides_dict.get('SeriesNumber', "99"))
+        ds_sr.InstanceNumber = "1"
+        ds_sr.SOPInstanceUID = generate_uid()
 
-    sr_content_time_offset = datetime.timedelta(minutes=random.randint(5, 30), seconds=random.uniform(0, 59))
-    sr_base_time_str = first_instance_time_str if first_instance_time_str else study_time_base
-    try:
-        sr_base_dt = datetime.datetime.strptime(sr_base_time_str.split('.')[0], "%H%M%S")
-        sr_content_dt = sr_base_dt + sr_content_time_offset
-        sr_time_str = sr_content_dt.strftime("%H%M%S.%f")[:13]
-    except ValueError:
-        print(f"    Warning: Could not parse base time '{sr_base_time_str}' for SR timing offset. Using study base.", file=sys.stderr)
-        sr_base_dt = datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S")
-        sr_content_dt = sr_base_dt + sr_content_time_offset
-        sr_time_str = sr_content_dt.strftime("%H%M%S.%f")[:13]
+        sr_content_time_offset = datetime.timedelta(minutes=random.randint(5, 30), seconds=random.uniform(0, 59))
+        sr_base_time_str = first_instance_time_str if first_instance_time_str else study_time_base
+        try:
+            sr_base_dt = datetime.datetime.strptime(sr_base_time_str.split('.')[0], "%H%M%S")
+            sr_content_dt = sr_base_dt + sr_content_time_offset
+            sr_time_str = sr_content_dt.strftime("%H%M%S.%f")[:13]
+        except ValueError:
+            print(f"    Warning: Could not parse base time '{sr_base_time_str}' for SR timing offset. Using study base.", file=sys.stderr)
+            sr_base_dt = datetime.datetime.strptime(study_time_base.split('.')[0], "%H%M%S")
+            sr_content_dt = sr_base_dt + sr_content_time_offset
+            sr_time_str = sr_content_dt.strftime("%H%M%S.%f")[:13]
 
-    ds_sr.ContentDate = study_date
-    ds_sr.ContentTime = sr_time_str
-    ds_sr.SeriesDate = study_date
-    ds_sr.SeriesTime = sr_time_str
+        ds_sr.ContentDate = study_date
+        ds_sr.ContentTime = sr_time_str
+        ds_sr.SeriesDate = study_date
+        ds_sr.SeriesTime = sr_time_str
 
-    report_text = generate_fake_report_text(fake, chosen_modality_for_images, study_description)
-    try:
-        if (hasattr(ds_sr, 'ContentSequence') and ds_sr.ContentSequence and
-            hasattr(ds_sr.ContentSequence[0], 'ContentSequence') and ds_sr.ContentSequence[0].ContentSequence and
-            hasattr(ds_sr.ContentSequence[0].ContentSequence[0], 'TextValue')):
-             ds_sr.ContentSequence[0].ContentSequence[0].TextValue = report_text
-             if not args.quiet:
-                 print("    Set SR report text.")
-        else:
-             print("    ***WARNING*** SR ContentSequence structure invalid or missing. Cannot set report text.", file=sys.stderr)
-             try:
-                 if hasattr(ds_sr, 'ContentSequence') and ds_sr.ContentSequence:
-                     fallback_text_item = Dataset()
-                     fallback_text_item.RelationshipType = "CONTAINS"; fallback_text_item.ValueType = "TEXT"
-                     fallback_text_item.ConceptNameCodeSequence = Sequence([Dataset(CodeValue="121071", CodingSchemeDesignator="DCM", CodeMeaning="Findings")])
-                     fallback_text_item.TextValue = "Fallback Report Text - Structure Error"
-                     if ds_sr.ContentSequence and hasattr(ds_sr.ContentSequence[0], 'ContentSequence'):
-                        ds_sr.ContentSequence[0].ContentSequence.append(fallback_text_item)
-                     elif ds_sr.ContentSequence:
-                        ds_sr.ContentSequence.append(fallback_text_item)
+        report_text = generate_fake_report_text(fake, chosen_modality_for_images, study_description)
+        try:
+            if (hasattr(ds_sr, 'ContentSequence') and ds_sr.ContentSequence and
+                hasattr(ds_sr.ContentSequence[0], 'ContentSequence') and ds_sr.ContentSequence[0].ContentSequence and
+                hasattr(ds_sr.ContentSequence[0].ContentSequence[0], 'TextValue')):
+                 ds_sr.ContentSequence[0].ContentSequence[0].TextValue = report_text
+                 if not args.quiet:
+                     print("    Set SR report text.")
+            else:
+                 print("    ***WARNING*** SR ContentSequence structure invalid or missing. Cannot set report text.", file=sys.stderr)
+                 try:
+                     if hasattr(ds_sr, 'ContentSequence') and ds_sr.ContentSequence:
+                         fallback_text_item = Dataset()
+                         fallback_text_item.RelationshipType = "CONTAINS"; fallback_text_item.ValueType = "TEXT"
+                         fallback_text_item.ConceptNameCodeSequence = Sequence([Dataset(CodeValue="121071", CodingSchemeDesignator="DCM", CodeMeaning="Findings")])
+                         fallback_text_item.TextValue = "Fallback Report Text - Structure Error"
+                         if ds_sr.ContentSequence and hasattr(ds_sr.ContentSequence[0], 'ContentSequence'):
+                            ds_sr.ContentSequence[0].ContentSequence.append(fallback_text_item)
+                         elif ds_sr.ContentSequence:
+                            ds_sr.ContentSequence.append(fallback_text_item)
+                         else:
+                             ds_sr.ContentSequence = Sequence([fallback_text_item])
+                         print("    Added fallback text item to SR.", file=sys.stderr)
                      else:
-                         ds_sr.ContentSequence = Sequence([fallback_text_item])
-                     print("    Added fallback text item to SR.", file=sys.stderr)
-                 else:
-                     print("    Cannot add fallback text, ContentSequence missing entirely.", file=sys.stderr)
-             except Exception as fallback_err:
-                 print(f"    ***ERROR*** Could not even add fallback SR text: {fallback_err}", file=sys.stderr)
-    except Exception as e:
-        print(f"    ***ERROR*** Unexpected error setting SR TextValue: {e}", file=sys.stderr)
+                         print("    Cannot add fallback text, ContentSequence missing entirely.", file=sys.stderr)
+                 except Exception as fallback_err:
+                     print(f"    ***ERROR*** Could not even add fallback SR text: {fallback_err}", file=sys.stderr)
+        except Exception as e:
+            print(f"    ***ERROR*** Unexpected error setting SR TextValue: {e}", file=sys.stderr)
 
 
-    apply_overrides(ds_sr, overrides_dict, quiet=args.quiet)
+        apply_overrides(ds_sr, overrides_dict, quiet=args.quiet)
 
-    ds_sr.SOPInstanceUID = ds_sr.SOPInstanceUID
-    ds_sr.SOPClassUID = sr_sop_class_uid
-    ds_sr.Modality = "SR"
-    if not hasattr(ds_sr, 'SpecificCharacterSet') or not ds_sr.SpecificCharacterSet:
+        ds_sr.SOPInstanceUID = ds_sr.SOPInstanceUID
+        ds_sr.SOPClassUID = sr_sop_class_uid
+        ds_sr.Modality = "SR"
+        if not hasattr(ds_sr, 'SpecificCharacterSet') or not ds_sr.SpecificCharacterSet:
+            if not args.quiet:
+                print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) to SR after overrides.")
+            ds_sr.SpecificCharacterSet = DEFAULT_CHARACTER_SET
+
+        file_meta_sr = create_file_meta()
+        file_meta_sr.MediaStorageSOPClassUID = sr_sop_class_uid
+        file_meta_sr.MediaStorageSOPInstanceUID = ds_sr.SOPInstanceUID
+
+        file_ds_sr = pydicom.FileDataset(
+            filename_or_obj=None, dataset=ds_sr, file_meta=file_meta_sr, preamble=b"\0" * 128
+        )
+
+        filename_sr = study_output_path / f"SR_{ds_sr.SOPInstanceUID}.dcm"
         if not args.quiet:
-            print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) to SR after overrides.")
-        ds_sr.SpecificCharacterSet = DEFAULT_CHARACTER_SET
+            print(f"    Saving: {filename_sr.name}")
+        try:
+            file_ds_sr.save_as(filename_sr, write_like_original=False)
+            if not args.quiet:
+                print("Finished generating SR object.")
+        except Exception as e:
+            print(f"    ***ERROR*** Failed to save SR file {filename_sr.name}: {e}", file=sys.stderr)
 
 
-    file_meta_sr = create_file_meta()
-    file_meta_sr.MediaStorageSOPClassUID = sr_sop_class_uid
-    file_meta_sr.MediaStorageSOPInstanceUID = ds_sr.SOPInstanceUID
-
-    file_ds_sr = pydicom.FileDataset(
-        filename_or_obj=None, dataset=ds_sr, file_meta=file_meta_sr, preamble=b"\0" * 128
-    )
-
-    filename_sr = study_output_path / f"SR_{ds_sr.SOPInstanceUID}.dcm"
-    if not args.quiet:
-        print(f"    Saving: {filename_sr.name}")
-    try:
-        file_ds_sr.save_as(filename_sr, write_like_original=False)
         if not args.quiet:
-            print("Finished generating SR object.")
-    except Exception as e:
-        print(f"    ***ERROR*** Failed to save SR file {filename_sr.name}: {e}", file=sys.stderr)
-
-
-    if not args.quiet:
-        print("-" * 30)
-        print(f"Successfully generated {NUM_IMAGES + 1} DICOM objects for study {study_instance_uid}")
-        print(f"Files saved in study directory: {study_output_path.resolve()}")
-        print(f"(Base directory: {Path(args.base_dir).resolve()})")
-        print("-" * 30)
+            print("-" * 30)
+            print(f"Successfully generated {NUM_IMAGES + 1} DICOM objects for study {study_instance_uid}")
+            print(f"Files saved in study directory: {study_output_path.resolve()}")
+            print(f"(Base directory: {Path(args.base_dir).resolve()})")
+            print("-" * 30)

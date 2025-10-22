@@ -59,6 +59,7 @@ Performance testing tool for measuring DICOMweb retrieval throughput and latency
 * `-n <number>` - Total number of requests to send (unlimited by default, requires `-d` if not specified)
 * `-d <seconds>` - Duration to run the test in seconds (unlimited by default, requires `-n` if not specified)
 * `-t <seconds>` - Per-request timeout in seconds (default: 20)
+* `-r <number>` - Maximum number of retries for HTTP 429 errors (default: 3, set to 0 to disable)
 * `-o <directory>` - Output directory to save results and graphs (default: ./output)
 * `-g` - Generate graphs (requires gnuplot to be installed)
 * `-v` - Verbose mode - shows individual request results
@@ -124,6 +125,7 @@ Test with graph generation and custom output directory:
 * You must specify either `-n` (max requests), `-d` (duration), or both
 * The script uses `gcloud auth application-default print-access-token` for authentication
 * Results are saved as CSV and text files with timestamp in the output directory
+* HTTP 429 (Too Many Requests) errors are automatically retried with exponential backoff (1s, 2s, 4s, etc.)
 * Graph generation requires `gnuplot` to be installed (install with `apt-get install gnuplot` or `brew install gnuplot`)
 * HTTP 200 responses are considered successful; all others are tracked as errors
 * The output directory will be created if it doesn't exist

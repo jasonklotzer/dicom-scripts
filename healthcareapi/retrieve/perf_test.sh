@@ -13,6 +13,8 @@ VERBOSE=false
 OUTPUT_DIR="./output"
 GENERATE_GRAPH=false
 REQUEST_TIMEOUT=20
+MAX_RETRIES=3
+RETRY_DELAY=1
 
 fail() {
   printf >&2 "Error: $1\n"
@@ -40,7 +42,8 @@ Performance Options:
   -p <number>            Number of parallel requests (default: 10)
   -n <number>            Total number of requests to send (default: unlimited, requires -d)
   -d <seconds>           Duration to run the test in seconds (default: unlimited, requires -n)
-  -t <seconds>           Per-request timeout in seconds (default: 60)
+  -t <seconds>           Per-request timeout in seconds (default: 20)
+  -r <number>            Maximum number of retries for HTTP 429 errors (default: 3, 0 to disable)
   -v                     Verbose output (show individual request results)
   -o <directory>         Output directory to save results and graphs (default: ./output)
   -g                     Generate graphs (requires gnuplot to be installed)
@@ -66,13 +69,14 @@ EOF
 }
 
 # Parse command line arguments
-while getopts "w:p:n:d:t:o:gvh" opt; do
+while getopts "w:p:n:d:t:r:o:gvh" opt; do
   case $opt in
     w) DICOMWEB_PATH="$OPTARG" ;;
     p) PARALLEL_REQUESTS="$OPTARG" ;;
     n) MAX_REQUESTS="$OPTARG" ;;
     d) DURATION_SECONDS="$OPTARG" ;;
     t) REQUEST_TIMEOUT="$OPTARG" ;;
+    r) MAX_RETRIES="$OPTARG" ;;
     o) OUTPUT_DIR="$OPTARG" ;;
     g) GENERATE_GRAPH=true ;;
     v) VERBOSE=true ;;
@@ -129,6 +133,7 @@ fi
 [[ ! "$PARALLEL_REQUESTS" =~ ^[0-9]+$ ]] && fail "Parallel requests must be a positive integer"
 [[ ! "$MAX_REQUESTS" =~ ^[0-9]+$ ]] && fail "Max requests must be a non-negative integer"
 [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && fail "Duration must be a non-negative integer"
+[[ ! "$MAX_RETRIES" =~ ^[0-9]+$ ]] && fail "Max retries must be a non-negative integer"
 [ "$PARALLEL_REQUESTS" -lt 1 ] && fail "Parallel requests must be at least 1"
 
 # Validate graph options
@@ -172,29 +177,69 @@ do_request() {
   local results_file=$4
   local stop_flag=$5
   local verbose=$6
+  local max_retries=$7
+  
+  local attempt=0
+  local retry_delay=${RETRY_DELAY}
+  local http_result=""
+  local total_time_ms=0
   
   START_MS=$(date +%s%3N)
   
-  # Perform the retrieval request
-  HTTP_RESULT=$(curl -X GET \
-    --silent \
-    --output /dev/null \
-    --write-out "%{http_code}" \
-    --max-time ${REQUEST_TIMEOUT} \
-    -H "Authorization: Bearer ${bearer_token}" \
-    "${dicomweb_host}")
+  while [ $attempt -le $max_retries ]; do
+    local attempt_start=$(date +%s%3N)
+    
+    # Perform the retrieval request
+    http_result=$(curl -X GET \
+      --silent \
+      --output /dev/null \
+      --write-out "%{http_code}" \
+      --max-time ${REQUEST_TIMEOUT} \
+      -H "Authorization: Bearer ${bearer_token}" \
+      "${dicomweb_host}")
+    
+    local attempt_end=$(date +%s%3N)
+    local attempt_time=$((attempt_end - attempt_start))
+    
+    # If successful or not a 429 error, break
+    if [ "$http_result" != "429" ] || [ $max_retries -eq 0 ]; then
+      END_MS=$(date +%s%3N)
+      total_time_ms=$((END_MS - START_MS))
+      break
+    fi
+    
+    # If we've exhausted retries, break
+    if [ $attempt -ge $max_retries ]; then
+      END_MS=$(date +%s%3N)
+      total_time_ms=$((END_MS - START_MS))
+      break
+    fi
+    
+    # Retry with exponential backoff
+    attempt=$((attempt + 1))
+    local backoff_time=$(echo "$retry_delay * (2 ^ ($attempt - 1))" | bc)
+    
+    if [ "$verbose" = true ]; then
+      echo "[Worker $worker_id] ⚠ HTTP 429 - Retry $attempt/$max_retries after ${backoff_time}s"
+    fi
+    
+    sleep $backoff_time
+  done
   
-  END_MS=$(date +%s%3N)
-  TIME_MS=$((END_MS - START_MS))
-  
-  # Write result
-  echo "${HTTP_RESULT}|${TIME_MS}" >> "$results_file"
+  # Write result (add retry count as third column)
+  echo "${http_result}|${total_time_ms}|${attempt}" >> "$results_file"
   
   if [ "$verbose" = true ]; then
-    if [ "$HTTP_RESULT" = "200" ]; then
-      echo "[Worker $worker_id] ✓ HTTP ${HTTP_RESULT} - ${TIME_MS}ms"
+    if [ "$http_result" = "200" ]; then
+      if [ $attempt -gt 0 ]; then
+        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms (retried $attempt times)"
+      else
+        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms"
+      fi
+    elif [ "$http_result" = "429" ] && [ $attempt -gt 0 ]; then
+      echo "[Worker $worker_id] ✗ HTTP ${http_result} - ${total_time_ms}ms (FAILED after $attempt retries)"
     else
-      echo "[Worker $worker_id] ✗ HTTP ${HTTP_RESULT} - ${TIME_MS}ms (FAILED)"
+      echo "[Worker $worker_id] ✗ HTTP ${http_result} - ${total_time_ms}ms (FAILED)"
     fi
   fi
   
@@ -209,9 +254,10 @@ worker() {
   local results_file=$4
   local stop_flag=$5
   local verbose=$6
+  local max_retries=$7
   
   while [ ! -f "$stop_flag" ]; do
-    do_request "$worker_id" "$bearer_token" "$dicomweb_host" "$results_file" "$stop_flag" "$verbose"
+    do_request "$worker_id" "$bearer_token" "$dicomweb_host" "$results_file" "$stop_flag" "$verbose" "$max_retries"
   done
 }
 
@@ -219,7 +265,7 @@ worker() {
 # Start workers and track their PIDs
 WORKER_PIDS=()
 for i in $(seq 1 $PARALLEL_REQUESTS); do
-  worker "$i" "$BEARER_TOKEN" "$DICOMWEB_HOST" "$RESULTS_FILE" "$STOP_FLAG" "$VERBOSE" &
+  worker "$i" "$BEARER_TOKEN" "$DICOMWEB_HOST" "$RESULTS_FILE" "$STOP_FLAG" "$VERBOSE" "$MAX_RETRIES" &
   WORKER_PIDS+=("$!")
 done
 
@@ -318,6 +364,37 @@ if [ "$SUCCESS_COUNT" -gt 0 ]; then
   P90_TIME=$(echo "$TIMES" | sed -n "${P90_INDEX}p")
 fi
 
+# Parse results (now with retry column)
+SUCCESS_COUNT=$(grep -c "^200|" "$RESULTS_FILE" || true)
+ERROR_COUNT=$((TOTAL_REQUESTS - SUCCESS_COUNT))
+
+# Count retried requests (any with retry count > 0)
+RETRIED_COUNT=$(awk -F'|' '$3 > 0 {c++} END {print c+0}' "$RESULTS_FILE")
+RETRIED_SUCCESS=$(awk -F'|' '$1=="200" && $3 > 0 {c++} END {print c+0}' "$RESULTS_FILE")
+
+# Calculate timing statistics for successful requests
+if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  TIMES=$(grep "^200|" "$RESULTS_FILE" | cut -d'|' -f2 | sort -n)
+  
+  MIN_TIME=$(echo "$TIMES" | head -n1)
+  MAX_TIME=$(echo "$TIMES" | tail -n1)
+  AVG_TIME=$(echo "$TIMES" | awk '{sum+=$1} END {print sum/NR}' | xargs printf "%.0f")
+  
+  # Calculate median
+  MEDIAN_TIME=$(echo "$TIMES" | awk '{arr[NR]=$1} END {
+    if (NR % 2 == 1) {
+      print arr[(NR+1)/2]
+    } else {
+      print (arr[NR/2] + arr[NR/2+1])/2
+    }
+  }' | xargs printf "%.0f")
+  
+  # Calculate 90th percentile
+  P90_INDEX=$(echo "scale=0; ($SUCCESS_COUNT * 90) / 100" | bc)
+  [ "$P90_INDEX" -lt 1 ] && P90_INDEX=1
+  P90_TIME=$(echo "$TIMES" | sed -n "${P90_INDEX}p")
+fi
+
 # Print statistics
 echo "Total Requests: ${TOTAL_REQUESTS}"
 echo "Duration: ${TOTAL_TIME} seconds"
@@ -325,6 +402,10 @@ echo "Throughput: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) reque
 echo ""
 echo "Success: ${SUCCESS_COUNT} ($(echo "scale=2; ($SUCCESS_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)"
 echo "Errors: ${ERROR_COUNT} ($(echo "scale=2; ($ERROR_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)"
+echo ""
+
+echo "Retries: ${RETRIED_COUNT} ($(echo "scale=2; ($RETRIED_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)"
+echo "Successful with Retries: ${RETRIED_SUCCESS} ($(echo "scale=2; ($RETRIED_SUCCESS * 100) / $SUCCESS_COUNT" | bc -l)%)"
 echo ""
 
 if [ "$SUCCESS_COUNT" -gt 0 ]; then
@@ -360,6 +441,11 @@ echo "=== Saving Results ==="
   echo "timestamp_ms,http_code,response_time_ms" > "$RESULTS_CSV"
   awk -F'|' '{print NR","$1","$2}' "$RESULTS_FILE" >> "$RESULTS_CSV"
   echo "Raw results saved to: ${RESULTS_CSV}"
+
+    # Save raw results as CSV (now with retries)
+    echo "timestamp_ms,http_code,response_time_ms,retries" > "$RESULTS_CSV"
+    awk -F'|' '{print NR","$1","$2","$3}' "$RESULTS_FILE" >> "$RESULTS_CSV"
+    echo "Raw results saved to: ${RESULTS_CSV}"
   
   # Save statistics summary
   cat > "$STATS_FILE" << EOF
@@ -382,6 +468,8 @@ Throughput: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) requests/se
 
 Success: ${SUCCESS_COUNT} ($(echo "scale=2; ($SUCCESS_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)
 Errors: ${ERROR_COUNT} ($(echo "scale=2; ($ERROR_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)
+  Retries: ${RETRIED_COUNT} ($(echo "scale=2; ($RETRIED_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)
+  Successful with Retries: ${RETRIED_SUCCESS} ($(echo "scale=2; ($RETRIED_SUCCESS * 100) / $SUCCESS_COUNT" | bc -l)%)
 
 $(if [ "$SUCCESS_COUNT" -gt 0 ]; then
   echo "Response Times (successful requests)"
@@ -414,7 +502,7 @@ if [ "$GENERATE_GRAPH" = true ]; then
   COMBINED_PNG="${OUTPUT_DIR}/summary_${TIMESTAMP}.png"
 
   # Extract all requests with request number, http code, and response time
-  awk -F'|' '{print NR, $1, $2}' "$RESULTS_FILE" > "${TEMP_DIR}/all_requests.dat"
+  awk -F'|' '{print NR, $1, $2, $3}' "$RESULTS_FILE" > "${TEMP_DIR}/all_requests.dat"
 
   # Extract successful and failed requests separately
   if [ "$SUCCESS_COUNT" -gt 0 ]; then
@@ -487,8 +575,9 @@ GNUPLOT_HISTOGRAM_EMPTY
       echo "Histogram saved to: ${HISTOGRAM_PNG} (empty)"
     fi
     
-    # Generate time series graph with success/failure indicators
-    gnuplot 2>/dev/null << GNUPLOT_TIMESERIES
+  # Generate time series graph with success/failure indicators
+  gnuplot 2>/dev/null << GNUPLOT_TIMESERIES
+stats '${TEMP_DIR}/all_requests.dat' using 3 nooutput
 set terminal png size 1200,600 font "Arial,12"
 set output '${TIMESERIES_PNG}'
 set title "Response Time Over Test Duration\n${LEVEL} level - Success: ${SUCCESS_COUNT}, Failures: ${ERROR_COUNT}"
@@ -499,10 +588,13 @@ set key top left
 
 stats '${TEMP_DIR}/all_requests.dat' using 3 nooutput
 
-plot '${TEMP_DIR}/all_requests.dat' using (\$2==200?\$1:1/0):3 with points pt 7 ps 0.7 lc rgb "blue" title "Successful (200)", \
-     '${TEMP_DIR}/all_requests.dat' using (\$2!=200?\$1:1/0):3 with points pt 5 ps 1 lc rgb "red" title "Failed (non-200)", \
-     ${AVG_TIME} with lines lc rgb "green" lw 2 title "Average (${AVG_TIME}ms)", \
-     ${P90_TIME} with lines lc rgb "orange" lw 2 title "P90 (${P90_TIME}ms)"
+# Plot: blue = success, red = fail, orange = retried success
+plot \
+  '${TEMP_DIR}/all_requests.dat' using (\$2==200 && \$4==0?\$1:1/0):3 with points pt 7 ps 0.7 lc rgb "blue" title "Successful (no retry)", \
+  '${TEMP_DIR}/all_requests.dat' using (\$2==200 && \$4>0?\$1:1/0):3 with points pt 9 ps 1 lc rgb "orange" title "Successful (retried)", \
+  '${TEMP_DIR}/all_requests.dat' using (\$2!=200?\$1:1/0):3 with points pt 5 ps 1 lc rgb "red" title "Failed (non-200)", \
+  ${AVG_TIME} with lines lc rgb "green" lw 2 title "Average (${AVG_TIME}ms)", \
+  ${P90_TIME} with lines lc rgb "orange" lw 2 title "P90 (${P90_TIME}ms)"
 GNUPLOT_TIMESERIES
     
     echo "Time series saved to: ${TIMESERIES_PNG}"

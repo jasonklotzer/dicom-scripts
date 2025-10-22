@@ -1,0 +1,29 @@
+DICOM Retrieval Performance Test Results
+========================================
+Test Date: Wed Oct 22 07:02:19 PM UTC 2025
+DICOMweb URL: https://healthcare.googleapis.com/v1/projects/data-axe-350723/locations/us-central1/datasets/ds1/dicomStores/test/dicomWeb/studies/1.3.6.1.4.1.14519.5.2.1.5438.5601.883798764358380577682162142297/series/1.3.6.1.4.1.14519.5.2.1.5438.5601.219329066039528560568415843579/instances/1.3.6.1.4.1.14519.5.2.1.5438.5601.100264213214051490756807574457
+Detected Level: instance
+Study UID: 1.3.6.1.4.1.14519.5.2.1.5438.5601.883798764358380577682162142297
+Series UID: 1.3.6.1.4.1.14519.5.2.1.5438.5601.219329066039528560568415843579
+Instance UID: 1.3.6.1.4.1.14519.5.2.1.5438.5601.100264213214051490756807574457
+
+Parallel Requests: 5
+
+Test Results
+============
+Total Requests: 20
+Duration: 2 seconds
+Throughput: 10.00 requests/second
+
+Success: 20 (100.00%)
+Errors: 0 (0%)
+
+Response Times (successful requests)
+====================================
+Min: 475ms
+Max: 640ms
+Avg: 553ms
+Median: 538ms
+P90: 623ms
+
+

@@ -1,0 +1,649 @@
+#!/bin/bash
+
+set -e
+
+REQ_COMMANDS="gcloud curl bc"
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+
+# Default values
+PARALLEL_REQUESTS=10
+MAX_REQUESTS=0
+DURATION_SECONDS=0
+VERBOSE=false
+OUTPUT_DIR="./output"
+GENERATE_GRAPH=false
+REQUEST_TIMEOUT=20
+
+fail() {
+  printf >&2 "Error: $1\n"
+  exit 1
+}
+
+reqCmdExists() {
+  command -v $1 >/dev/null 2>&1 || { fail "Command '$1' is required, but not installed."; }
+}
+
+usage() {
+  cat << EOF
+Usage: $0 -w <dicomwebPath> [options]
+
+Required arguments:
+  -w <dicomwebPath>      Full DICOMweb path to test. The level (study/series/instance/frame) is auto-detected.
+                         Examples:
+                           Study:    .../dicomWeb/studies/1.2.3.4
+                           Series:   .../dicomWeb/studies/1.2.3.4/series/1.2.3.5
+                           Instance: .../dicomWeb/studies/1.2.3.4/series/1.2.3.5/instances/1.2.3.6
+                           Frame:    .../dicomWeb/studies/1.2.3.4/series/1.2.3.5/instances/1.2.3.6/frames/1
+
+
+Performance Options:
+  -p <number>            Number of parallel requests (default: 10)
+  -n <number>            Total number of requests to send (default: unlimited, requires -d)
+  -d <seconds>           Duration to run the test in seconds (default: unlimited, requires -n)
+  -t <seconds>           Per-request timeout in seconds (default: 60)
+  -v                     Verbose output (show individual request results)
+  -o <directory>         Output directory to save results and graphs (default: ./output)
+  -g                     Generate graphs (requires gnuplot to be installed)
+  -h                     Show this help message
+
+Examples:
+  # Test study-level retrieval
+  $0 -w "https://healthcare.googleapis.com/v1/projects/my-project/locations/us-central1/datasets/my-dataset/dicomStores/my-store/dicomWeb/studies/1.2.3.4" -n 100 -p 10
+
+  # Test series-level retrieval (with shortened path)
+  $0 -w "projects/my-project/locations/us-central1/datasets/my-dataset/dicomStores/my-store/dicomWeb/studies/1.2.3.4/series/1.2.3.5" -d 60 -p 5
+
+  # Test instance-level retrieval
+  $0 -w "projects/my-project/.../dicomStores/my-store/dicomWeb/studies/1.2.3.4/series/1.2.3.5/instances/1.2.3.6" -n 200 -p 15
+
+  # Test frame-level retrieval
+  $0 -w "projects/my-project/.../dicomWeb/studies/1.2.3.4/series/1.2.3.5/instances/1.2.3.6/frames/1" -n 500 -d 120 -p 20
+  
+  # Test with graph generation
+  $0 -w "projects/my-project/.../dicomWeb/studies/1.2.3.4" -n 1000 -p 10 -o ./results -g
+EOF
+  exit 0
+}
+
+# Parse command line arguments
+while getopts "w:p:n:d:t:o:gvh" opt; do
+  case $opt in
+    w) DICOMWEB_PATH="$OPTARG" ;;
+    p) PARALLEL_REQUESTS="$OPTARG" ;;
+    n) MAX_REQUESTS="$OPTARG" ;;
+    d) DURATION_SECONDS="$OPTARG" ;;
+    t) REQUEST_TIMEOUT="$OPTARG" ;;
+    o) OUTPUT_DIR="$OPTARG" ;;
+    g) GENERATE_GRAPH=true ;;
+    v) VERBOSE=true ;;
+    h) usage ;;
+    \?) fail "Invalid option: -$OPTARG" ;;
+  esac
+done
+
+# Validate required commands
+for COMMAND in $REQ_COMMANDS; do reqCmdExists ${COMMAND}; done
+
+# Validate required arguments
+[ -z "$DICOMWEB_PATH" ] && fail "DICOMweb path is required (-w)"
+
+# Normalize the path - add https prefix if not present
+if [[ ! "$DICOMWEB_PATH" =~ ^https?:// ]]; then
+  HCAPI_HOST=https://healthcare.googleapis.com/v1
+  # Remove leading slash if present
+  DICOMWEB_PATH="${DICOMWEB_PATH#/}"
+  DICOMWEB_HOST="${HCAPI_HOST}/${DICOMWEB_PATH}"
+else
+  DICOMWEB_HOST="$DICOMWEB_PATH"
+fi
+
+# Auto-detect the level based on the path
+if [[ "$DICOMWEB_HOST" =~ /frames/[^/]+$ ]]; then
+  LEVEL="frame"
+  FRAME_NUMBER=$(echo "$DICOMWEB_HOST" | grep -oP '/frames/\K[^/]+$')
+  INSTANCE_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/instances/\K[^/]+(?=/frames)')
+  SERIES_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/series/\K[^/]+(?=/instances)')
+  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+(?=/series)')
+elif [[ "$DICOMWEB_HOST" =~ /instances/[^/]+$ ]]; then
+  LEVEL="instance"
+  INSTANCE_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/instances/\K[^/]+$')
+  SERIES_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/series/\K[^/]+(?=/instances)')
+  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+(?=/series)')
+elif [[ "$DICOMWEB_HOST" =~ /series/[^/]+$ ]]; then
+  LEVEL="series"
+  SERIES_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/series/\K[^/]+$')
+  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+(?=/series)')
+elif [[ "$DICOMWEB_HOST" =~ /studies/[^/]+$ ]]; then
+  LEVEL="study"
+  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+$')
+else
+  fail "Invalid DICOMweb path. Path must end with /studies/<uid>, /series/<uid>, /instances/<uid>, or /frames/<number>"
+fi
+
+# Validate that at least one stopping condition is provided
+if [ "$MAX_REQUESTS" -eq 0 ] && [ "$DURATION_SECONDS" -eq 0 ]; then
+  fail "Must specify either -n (max requests) or -d (duration) or both"
+fi
+
+# Validate numeric arguments
+[[ ! "$PARALLEL_REQUESTS" =~ ^[0-9]+$ ]] && fail "Parallel requests must be a positive integer"
+[[ ! "$MAX_REQUESTS" =~ ^[0-9]+$ ]] && fail "Max requests must be a non-negative integer"
+[[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && fail "Duration must be a non-negative integer"
+[ "$PARALLEL_REQUESTS" -lt 1 ] && fail "Parallel requests must be at least 1"
+
+# Validate graph options
+if [ "$GENERATE_GRAPH" = true ]; then
+  command -v gnuplot >/dev/null 2>&1 || fail "Graph generation requires 'gnuplot' to be installed"
+fi
+
+# Setup output directory - create it and convert to absolute path
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+
+# Get authentication token
+
+BEARER_TOKEN=$(gcloud auth application-default print-access-token)
+TEMP_DIR=$(mktemp -d)
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+RESULTS_FILE="${OUTPUT_DIR}/results_${TIMESTAMP}.txt"
+STOP_FLAG="${TEMP_DIR}/stop"
+
+# Clean up temp dir on exit
+trap "rm -rf ${TEMP_DIR}" EXIT
+
+echo "=== DICOM Retrieval Performance Test ==="
+echo "DICOMweb URL: ${DICOMWEB_HOST}"
+echo "Detected Level: ${LEVEL}"
+echo "Study UID: ${STUDY_UID}"
+[ -n "$SERIES_UID" ] && echo "Series UID: ${SERIES_UID}"
+[ -n "$INSTANCE_UID" ] && echo "Instance UID: ${INSTANCE_UID}"
+[ -n "$FRAME_NUMBER" ] && echo "Frame Number: ${FRAME_NUMBER}"
+echo "Parallel Requests: ${PARALLEL_REQUESTS}"
+[ "$MAX_REQUESTS" -gt 0 ] && echo "Max Requests: ${MAX_REQUESTS}"
+[ "$DURATION_SECONDS" -gt 0 ] && echo "Duration: ${DURATION_SECONDS} seconds"
+echo "========================================"
+echo ""
+
+# Worker function to perform a single request
+do_request() {
+  local worker_id=$1
+  local bearer_token=$2
+  local dicomweb_host=$3
+  local results_file=$4
+  local stop_flag=$5
+  local verbose=$6
+  
+  START_MS=$(date +%s%3N)
+  
+  # Perform the retrieval request
+  HTTP_RESULT=$(curl -X GET \
+    --silent \
+    --output /dev/null \
+    --write-out "%{http_code}" \
+    --max-time ${REQUEST_TIMEOUT} \
+    -H "Authorization: Bearer ${bearer_token}" \
+    "${dicomweb_host}")
+  
+  END_MS=$(date +%s%3N)
+  TIME_MS=$((END_MS - START_MS))
+  
+  # Write result
+  echo "${HTTP_RESULT}|${TIME_MS}" >> "$results_file"
+  
+  if [ "$verbose" = true ]; then
+    if [ "$HTTP_RESULT" = "200" ]; then
+      echo "[Worker $worker_id] ✓ HTTP ${HTTP_RESULT} - ${TIME_MS}ms"
+    else
+      echo "[Worker $worker_id] ✗ HTTP ${HTTP_RESULT} - ${TIME_MS}ms (FAILED)"
+    fi
+  fi
+  
+  return 0
+}
+
+# Worker process
+worker() {
+  local worker_id=$1
+  local bearer_token=$2
+  local dicomweb_host=$3
+  local results_file=$4
+  local stop_flag=$5
+  local verbose=$6
+  
+  while [ ! -f "$stop_flag" ]; do
+    do_request "$worker_id" "$bearer_token" "$dicomweb_host" "$results_file" "$stop_flag" "$verbose"
+  done
+}
+
+
+# Start workers and track their PIDs
+WORKER_PIDS=()
+for i in $(seq 1 $PARALLEL_REQUESTS); do
+  worker "$i" "$BEARER_TOKEN" "$DICOMWEB_HOST" "$RESULTS_FILE" "$STOP_FLAG" "$VERBOSE" &
+  WORKER_PIDS+=("$!")
+done
+
+START_TIME=$(date +%s)
+REQUEST_COUNT=0
+
+# Monitor progress
+while true; do
+  sleep 1
+  
+  if [ -f "$RESULTS_FILE" ]; then
+    REQUEST_COUNT=$(wc -l < "$RESULTS_FILE")
+  fi
+  
+  ELAPSED=$(($(date +%s) - START_TIME))
+  
+  # Check stopping conditions
+  SHOULD_STOP=false
+  
+  if [ "$MAX_REQUESTS" -gt 0 ] && [ "$REQUEST_COUNT" -ge "$MAX_REQUESTS" ]; then
+    SHOULD_STOP=true
+    echo " | Reached max requests limit!"
+  fi
+  
+  if [ "$DURATION_SECONDS" -gt 0 ] && [ "$ELAPSED" -ge "$DURATION_SECONDS" ]; then
+    SHOULD_STOP=true
+    echo " | Reached time limit!"
+  fi
+  
+  if [ "$SHOULD_STOP" = true ]; then
+    touch "$STOP_FLAG"
+    break
+  fi
+  
+  # Progress update
+  if [ "$VERBOSE" = false ]; then
+    printf "\rRequests: %d | Elapsed: %ds | Rate: %.2f req/s" \
+      "$REQUEST_COUNT" \
+      "$ELAPSED" \
+      $(echo "scale=2; $REQUEST_COUNT / $ELAPSED" | bc -l)
+  fi
+done
+
+
+# Wait for all workers to finish, but after stop flag is set, kill any that are still running
+for pid in "${WORKER_PIDS[@]}"; do
+  if kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" || true
+  fi
+done
+
+# After waiting, forcibly kill any remaining worker processes (shouldn't be needed, but just in case)
+for pid in "${WORKER_PIDS[@]}"; do
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+done
+
+echo ""
+echo ""
+echo "=== Test Complete ==="
+
+# Calculate statistics
+if [ ! -f "$RESULTS_FILE" ] || [ ! -s "$RESULTS_FILE" ]; then
+  echo "No results collected"
+  exit 1
+fi
+
+TOTAL_REQUESTS=$(wc -l < "$RESULTS_FILE")
+TOTAL_TIME=$(($(date +%s) - START_TIME))
+
+# Parse results
+SUCCESS_COUNT=$(grep -c "^200|" "$RESULTS_FILE" || true)
+ERROR_COUNT=$((TOTAL_REQUESTS - SUCCESS_COUNT))
+
+# Calculate timing statistics for successful requests
+if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  TIMES=$(grep "^200|" "$RESULTS_FILE" | cut -d'|' -f2 | sort -n)
+  
+  MIN_TIME=$(echo "$TIMES" | head -n1)
+  MAX_TIME=$(echo "$TIMES" | tail -n1)
+  AVG_TIME=$(echo "$TIMES" | awk '{sum+=$1} END {print sum/NR}' | xargs printf "%.0f")
+  
+  # Calculate median
+  MEDIAN_TIME=$(echo "$TIMES" | awk '{arr[NR]=$1} END {
+    if (NR % 2 == 1) {
+      print arr[(NR+1)/2]
+    } else {
+      print (arr[NR/2] + arr[NR/2+1])/2
+    }
+  }' | xargs printf "%.0f")
+  
+  # Calculate 90th percentile
+  P90_INDEX=$(echo "scale=0; ($SUCCESS_COUNT * 90) / 100" | bc)
+  [ "$P90_INDEX" -lt 1 ] && P90_INDEX=1
+  P90_TIME=$(echo "$TIMES" | sed -n "${P90_INDEX}p")
+fi
+
+# Print statistics
+echo "Total Requests: ${TOTAL_REQUESTS}"
+echo "Duration: ${TOTAL_TIME} seconds"
+echo "Throughput: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) requests/second"
+echo ""
+echo "Success: ${SUCCESS_COUNT} ($(echo "scale=2; ($SUCCESS_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)"
+echo "Errors: ${ERROR_COUNT} ($(echo "scale=2; ($ERROR_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)"
+echo ""
+
+if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  echo "=== Response Times (successful requests) ==="
+  echo "Min: ${MIN_TIME}ms"
+  echo "Max: ${MAX_TIME}ms"
+  echo "Avg: ${AVG_TIME}ms"
+  echo "Median: ${MEDIAN_TIME}ms"
+  echo "P90: ${P90_TIME}ms"
+fi
+
+# Show error breakdown if any
+if [ "$ERROR_COUNT" -gt 0 ]; then
+  echo ""
+  echo "=== Error Breakdown ==="
+  grep -v "^200|" "$RESULTS_FILE" | cut -d'|' -f1 | sort | uniq -c | while read count code; do
+    echo "HTTP ${code}: ${count} occurrences"
+  done
+fi
+
+echo ""
+echo "Test completed successfully!"
+
+# Save results (always saved to OUTPUT_DIR)
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+RESULTS_CSV="${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
+STATS_FILE="${OUTPUT_DIR}/stats_${TIMESTAMP}.txt"
+
+echo ""
+echo "=== Saving Results ==="
+  
+  # Save raw results as CSV
+  echo "timestamp_ms,http_code,response_time_ms" > "$RESULTS_CSV"
+  awk -F'|' '{print NR","$1","$2}' "$RESULTS_FILE" >> "$RESULTS_CSV"
+  echo "Raw results saved to: ${RESULTS_CSV}"
+  
+  # Save statistics summary
+  cat > "$STATS_FILE" << EOF
+DICOM Retrieval Performance Test Results
+========================================
+Test Date: $(date)
+DICOMweb URL: ${DICOMWEB_HOST}
+Detected Level: ${LEVEL}
+Study UID: ${STUDY_UID}
+$([ -n "$SERIES_UID" ] && echo "Series UID: ${SERIES_UID}")
+$([ -n "$INSTANCE_UID" ] && echo "Instance UID: ${INSTANCE_UID}")
+$([ -n "$FRAME_NUMBER" ] && echo "Frame Number: ${FRAME_NUMBER}")
+Parallel Requests: ${PARALLEL_REQUESTS}
+
+Test Results
+============
+Total Requests: ${TOTAL_REQUESTS}
+Duration: ${TOTAL_TIME} seconds
+Throughput: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) requests/second
+
+Success: ${SUCCESS_COUNT} ($(echo "scale=2; ($SUCCESS_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)
+Errors: ${ERROR_COUNT} ($(echo "scale=2; ($ERROR_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)
+
+$(if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  echo "Response Times (successful requests)"
+  echo "===================================="
+  echo "Min: ${MIN_TIME}ms"
+  echo "Max: ${MAX_TIME}ms"
+  echo "Avg: ${AVG_TIME}ms"
+  echo "Median: ${MEDIAN_TIME}ms"
+  echo "P90: ${P90_TIME}ms"
+fi)
+
+$(if [ "$ERROR_COUNT" -gt 0 ]; then
+  echo "Error Breakdown"
+  echo "==============="
+  grep -v "^200|" "$RESULTS_FILE" | cut -d'|' -f1 | sort | uniq -c | while read count code; do
+    echo "HTTP ${code}: ${count} occurrences"
+  done
+fi)
+EOF
+echo "Statistics saved to: ${STATS_FILE}"
+
+# Generate graphs if requested
+if [ "$GENERATE_GRAPH" = true ]; then
+  echo ""
+  echo "=== Generating Graphs ==="
+
+  HISTOGRAM_PNG="${OUTPUT_DIR}/histogram_${TIMESTAMP}.png"
+  TIMESERIES_PNG="${OUTPUT_DIR}/timeseries_${TIMESTAMP}.png"
+  STATUS_PNG="${OUTPUT_DIR}/status_codes_${TIMESTAMP}.png"
+  COMBINED_PNG="${OUTPUT_DIR}/summary_${TIMESTAMP}.png"
+
+  # Extract all requests with request number, http code, and response time
+  awk -F'|' '{print NR, $1, $2}' "$RESULTS_FILE" > "${TEMP_DIR}/all_requests.dat"
+
+  # Extract successful and failed requests separately
+  if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  awk -F'|' 'BEGIN{n=0} $1=="200" {n++; print n, $2}' "$RESULTS_FILE" > "${TEMP_DIR}/success_times.dat"
+  fi
+
+  if [ "$ERROR_COUNT" -gt 0 ]; then
+    grep -v "^200|" "$RESULTS_FILE" | awk -F'|' '{print NR, $1, $2}' > "${TEMP_DIR}/error_requests.dat"
+  fi
+
+  # Precompute status code counts for gnuplot
+  awk -F'|' '{print $1}' "$RESULTS_FILE" | sort | uniq -c | awk '{print $2, $1}' > "${TEMP_DIR}/status_codes.dat"
+
+  # Generate HTTP status code distribution chart
+  gnuplot 2>/dev/null << GNUPLOT_STATUS
+set terminal png size 1200,600 font "Arial,12"
+set output '${STATUS_PNG}'
+set title "HTTP Status Code Distribution\n${TOTAL_REQUESTS} total requests"
+set ylabel "Number of Requests"
+set xlabel "HTTP Status Code"
+set grid ytics
+set style fill solid 0.7
+set boxwidth 0.7 relative
+set yrange [0:*]
+set style data histogram
+set style histogram cluster gap 1
+
+plot "${TEMP_DIR}/status_codes.dat" using 2:xtic(1) with boxes lc rgb "blue" title "Request Count"
+GNUPLOT_STATUS
+
+  echo "Status code distribution saved to: ${STATUS_PNG}"
+
+  if [ "$SUCCESS_COUNT" -gt 0 ]; then
+    # Generate response time histogram (successful requests only)
+    if [ -s "${TEMP_DIR}/success_times.dat" ]; then
+      gnuplot 2>/dev/null << GNUPLOT_HISTOGRAM
+set terminal png size 1200,600 font "Arial,12"
+set output '${HISTOGRAM_PNG}'
+set title "Response Time Distribution\n${LEVEL} level - ${SUCCESS_COUNT} requests"
+set xlabel "Response Time (ms)"
+set ylabel "Frequency"
+set grid ytics
+set style fill solid 0.5
+set boxwidth 0.9 relative
+
+# Calculate histogram bins
+stats '${TEMP_DIR}/success_times.dat' using 2 nooutput
+binwidth = (STATS_max - STATS_min) / 50
+bin(x,width)=width*floor(x/width)
+
+if (STATS_max > STATS_min) {
+  plot '${TEMP_DIR}/success_times.dat' using (bin(column(2),binwidth)):(1.0) smooth freq with boxes lc rgb "blue" title "Response Time"
+} else {
+  set label 1 "Not enough data for histogram" at graph 0.5,0.5 center font "Arial,16"
+  plot -1 notitle
+}
+GNUPLOT_HISTOGRAM
+      echo "Histogram saved to: ${HISTOGRAM_PNG}"
+    else
+      # Create a dummy histogram if no data
+      gnuplot 2>/dev/null << GNUPLOT_HISTOGRAM_EMPTY
+set terminal png size 1200,600 font "Arial,12"
+set output '${HISTOGRAM_PNG}'
+set title "Response Time Distribution\n${LEVEL} level - 0 successful requests"
+set xlabel "Response Time (ms)"
+set ylabel "Frequency"
+set label 1 "No successful requests to plot" at graph 0.5,0.5 center font "Arial,16"
+plot -1 notitle
+GNUPLOT_HISTOGRAM_EMPTY
+      echo "Histogram saved to: ${HISTOGRAM_PNG} (empty)"
+    fi
+    
+    # Generate time series graph with success/failure indicators
+    gnuplot 2>/dev/null << GNUPLOT_TIMESERIES
+set terminal png size 1200,600 font "Arial,12"
+set output '${TIMESERIES_PNG}'
+set title "Response Time Over Test Duration\n${LEVEL} level - Success: ${SUCCESS_COUNT}, Failures: ${ERROR_COUNT}"
+set xlabel "Request Number"
+set ylabel "Response Time (ms)"
+set grid
+set key top left
+
+stats '${TEMP_DIR}/all_requests.dat' using 3 nooutput
+
+plot '${TEMP_DIR}/all_requests.dat' using (\$2==200?\$1:1/0):3 with points pt 7 ps 0.7 lc rgb "blue" title "Successful (200)", \
+     '${TEMP_DIR}/all_requests.dat' using (\$2!=200?\$1:1/0):3 with points pt 5 ps 1 lc rgb "red" title "Failed (non-200)", \
+     ${AVG_TIME} with lines lc rgb "green" lw 2 title "Average (${AVG_TIME}ms)", \
+     ${P90_TIME} with lines lc rgb "orange" lw 2 title "P90 (${P90_TIME}ms)"
+GNUPLOT_TIMESERIES
+    
+    echo "Time series saved to: ${TIMESERIES_PNG}"
+  fi
+  
+  # Build bottom right plot section
+  BOTTOM_RIGHT_PLOT=""
+  if [ "$SUCCESS_COUNT" -gt 10 ] && [ -s "${TEMP_DIR}/success_times.dat" ]; then
+    # Check if we have enough variation in the data for a meaningful histogram
+    DATA_RANGE=$(awk '{print $2}' "${TEMP_DIR}/success_times.dat" | sort -n | awk 'NR==1{min=$1} {max=$1} END{print max-min}')
+    if [ "$DATA_RANGE" -gt 0 ] 2>/dev/null; then
+      BOTTOM_RIGHT_PLOT="unset label 1
+set tics
+set title \"Response Time Distribution (Successful)\"
+set xlabel \"Response Time (ms)\"
+set ylabel \"Frequency\"
+set grid ytics
+set style fill solid 0.5
+set boxwidth 0.9 relative
+unset key
+stats '${TEMP_DIR}/success_times.dat' using 2 nooutput
+binwidth = (STATS_max - STATS_min) / 20
+if (binwidth <= 0) binwidth = 1
+bin(x,width)=width*floor(x/width)
+plot '${TEMP_DIR}/success_times.dat' using (bin(\$2,binwidth)):(1.0) smooth freq with boxes lc rgb \"blue\""
+    else
+      # Data has no variation
+      BOTTOM_RIGHT_PLOT="unset label 1
+unset label 2
+unset label 3
+unset label 4
+unset label 5
+unset label 6
+unset label 7
+unset label 8
+unset label 9
+unset label 10
+unset label 11
+unset label 12
+set border
+set tics
+set title \"Response Time Distribution\"
+set xlabel \"\"
+set ylabel \"\"
+unset grid
+unset key
+set label 100 \"All response times\\nidentical (${AVG_TIME}ms)\" at screen 0.65, screen 0.15 center font \"Arial,14\"
+plot -1 notitle"
+    fi
+  else
+    BOTTOM_RIGHT_PLOT="unset label 1
+unset label 2
+unset label 3
+unset label 4
+unset label 5
+unset label 6
+unset label 7
+unset label 8
+unset label 9
+unset label 10
+unset label 11
+unset label 12
+set border
+set tics
+set title \"Insufficient Data\"
+set xlabel \"\"
+set ylabel \"\"
+unset grid
+unset key
+set label 100 \"Not enough successful\\nrequests for distribution\" at screen 0.65, screen 0.15 center font \"Arial,14\"
+plot -1 notitle"
+  fi
+
+  # Build success labels
+  SUCCESS_LABELS=""
+  if [ "$SUCCESS_COUNT" -gt 0 ]; then
+    SUCCESS_LABELS="set label 8 \"Response Times (Successful)\" at screen 0.15, screen 0.20 font \"Arial,12\"
+set label 9 sprintf(\"Min: %d ms\", ${MIN_TIME}) at screen 0.15, screen 0.16
+set label 10 sprintf(\"Avg: %d ms\", ${AVG_TIME}) at screen 0.15, screen 0.13
+set label 11 sprintf(\"P90: %d ms\", ${P90_TIME}) at screen 0.15, screen 0.10
+set label 12 sprintf(\"Max: %d ms\", ${MAX_TIME}) at screen 0.15, screen 0.07"
+  fi
+
+  # Build time series plot lines
+  TIMESERIES_EXTRA=""
+  if [ "$SUCCESS_COUNT" -gt 0 ]; then
+    TIMESERIES_EXTRA=", \\
+     ${AVG_TIME} with lines lc rgb \"green\" lw 2 title \"Average\", \\
+     ${P90_TIME} with lines lc rgb \"orange\" lw 2 title \"P90\""
+  fi
+
+  # Generate combined summary graph
+  gnuplot 2>/dev/null << GNUPLOT_COMBINED
+set terminal png size 1600,1200 font "Arial,12"
+set output '${COMBINED_PNG}'
+set multiplot layout 2,2 title "Performance Test Summary - ${LEVEL} Level\\nSuccess: ${SUCCESS_COUNT} | Failures: ${ERROR_COUNT}" font "Arial,14"
+
+# Top left: Time series with success/failure
+set title "Response Time Over Test Duration"
+set xlabel "Request Number"
+set ylabel "Response Time (ms)"
+set grid
+set key top left
+plot '${TEMP_DIR}/all_requests.dat' using (\$2==200?\$1:1/0):3 with points pt 7 ps 0.5 lc rgb "blue" title "Success", \\
+     '${TEMP_DIR}/all_requests.dat' using (\$2!=200?\$1:1/0):3 with points pt 5 ps 0.8 lc rgb "red" title "Failed"${TIMESERIES_EXTRA}
+
+# Top right: HTTP Status Code Distribution
+set title "HTTP Status Code Distribution"
+set xlabel "Status Code"
+set ylabel "Count"
+set grid ytics
+set style fill solid 0.7
+set boxwidth 0.7 relative
+unset key
+set style data histogram
+plot '< awk -F"|" "{print \\\$1}" ${RESULTS_FILE} | sort | uniq -c | awk "{print \\\$2, \\\$1}"' using 2:xtic(1) with boxes lc rgb "blue"
+
+# Bottom left: Statistics summary (text)
+unset xlabel
+unset ylabel
+unset border
+unset tics
+set key off
+set xrange [0:1]
+set yrange [0:1]
+set label 1 "Test Statistics" at screen 0.15, screen 0.45 font "Arial,14"
+set label 2 sprintf("Total Requests: %d", ${TOTAL_REQUESTS}) at screen 0.15, screen 0.40
+set label 3 sprintf("Success Rate: %.1f%%", (${SUCCESS_COUNT}*100.0/${TOTAL_REQUESTS})) at screen 0.15, screen 0.37
+set label 4 sprintf("Failed Requests: %d", ${ERROR_COUNT}) at screen 0.15, screen 0.34
+set label 5 sprintf("Duration: %d seconds", ${TOTAL_TIME}) at screen 0.15, screen 0.31
+set label 6 sprintf("Throughput: %.2f req/s", ${TOTAL_REQUESTS}/${TOTAL_TIME}) at screen 0.15, screen 0.28
+set label 7 sprintf("Parallel Workers: %d", ${PARALLEL_REQUESTS}) at screen 0.15, screen 0.25
+${SUCCESS_LABELS}
+plot -1 notitle
+
+# Bottom right: Response time histogram (successful only) or placeholder
+${BOTTOM_RIGHT_PLOT}
+unset multiplot
+GNUPLOT_COMBINED
+  
+  echo "Combined summary saved to: ${COMBINED_PNG}"
+  echo ""
+  echo "All graphs generated successfully!"
+fi

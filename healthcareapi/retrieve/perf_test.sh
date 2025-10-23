@@ -15,6 +15,7 @@ GENERATE_GRAPH=false
 REQUEST_TIMEOUT=20
 MAX_RETRIES=3
 RETRY_DELAY=1
+RANDOMIZE=false
 
 fail() {
   printf >&2 "Error: $1\n"
@@ -27,11 +28,12 @@ reqCmdExists() {
 
 usage() {
   cat << EOF
-Usage: $0 -w <dicomwebPath> [options]
+Usage: $0 -f <pathsFile> [options]
 
 Required arguments:
-  -w <dicomwebPath>      Full DICOMweb path to test. The level (study/series/instance/frame) is auto-detected.
-                         Examples:
+  -f <pathsFile>         File containing a list of DICOMweb paths (one per line).
+                         The level (study/series/instance/frame) is auto-detected from the paths.
+                         Examples of paths in the file:
                            Study:    .../dicomWeb/studies/1.2.3.4
                            Series:   .../dicomWeb/studies/1.2.3.4/series/1.2.3.5
                            Instance: .../dicomWeb/studies/1.2.3.4/series/1.2.3.5/instances/1.2.3.6
@@ -44,39 +46,38 @@ Performance Options:
   -d <seconds>           Duration to run the test in seconds (default: unlimited, requires -n)
   -t <seconds>           Per-request timeout in seconds (default: 20)
   -r <number>            Maximum number of retries for HTTP 429 errors (default: 3, 0 to disable)
+  -R                     Randomize the order of paths (default: sequential)
   -v                     Verbose output (show individual request results)
   -o <directory>         Output directory to save results and graphs (default: ./output)
   -g                     Generate graphs (requires gnuplot to be installed)
   -h                     Show this help message
 
 Examples:
-  # Test study-level retrieval
-  $0 -w "https://healthcare.googleapis.com/v1/projects/my-project/locations/us-central1/datasets/my-dataset/dicomStores/my-store/dicomWeb/studies/1.2.3.4" -n 100 -p 10
+  # Test with instance list
+  $0 -f instances.txt -n 100 -p 10
 
-  # Test series-level retrieval (with shortened path)
-  $0 -w "projects/my-project/locations/us-central1/datasets/my-dataset/dicomStores/my-store/dicomWeb/studies/1.2.3.4/series/1.2.3.5" -d 60 -p 5
+  # Test with time limit
+  $0 -f instances.txt -d 60 -p 5
 
-  # Test instance-level retrieval
-  $0 -w "projects/my-project/.../dicomStores/my-store/dicomWeb/studies/1.2.3.4/series/1.2.3.5/instances/1.2.3.6" -n 200 -p 15
+  # Test with larger parallelism
+  $0 -f instances.txt -n 200 -p 15
 
-  # Test frame-level retrieval
-  $0 -w "projects/my-project/.../dicomWeb/studies/1.2.3.4/series/1.2.3.5/instances/1.2.3.6/frames/1" -n 500 -d 120 -p 20
-  
   # Test with graph generation
-  $0 -w "projects/my-project/.../dicomWeb/studies/1.2.3.4" -n 1000 -p 10 -o ./results -g
+  $0 -f instances.txt -n 1000 -p 10 -o ./results -g
 EOF
   exit 0
 }
 
 # Parse command line arguments
-while getopts "w:p:n:d:t:r:o:gvh" opt; do
+while getopts "f:p:n:d:t:r:o:Rgvh" opt; do
   case $opt in
-    w) DICOMWEB_PATH="$OPTARG" ;;
+    f) PATHS_FILE="$OPTARG" ;;
     p) PARALLEL_REQUESTS="$OPTARG" ;;
     n) MAX_REQUESTS="$OPTARG" ;;
     d) DURATION_SECONDS="$OPTARG" ;;
     t) REQUEST_TIMEOUT="$OPTARG" ;;
     r) MAX_RETRIES="$OPTARG" ;;
+    R) RANDOMIZE=true ;;
     o) OUTPUT_DIR="$OPTARG" ;;
     g) GENERATE_GRAPH=true ;;
     v) VERBOSE=true ;;
@@ -89,39 +90,43 @@ done
 for COMMAND in $REQ_COMMANDS; do reqCmdExists ${COMMAND}; done
 
 # Validate required arguments
-[ -z "$DICOMWEB_PATH" ] && fail "DICOMweb path is required (-w)"
+[ -z "$PATHS_FILE" ] && fail "Paths file is required (-f)"
+[ ! -f "$PATHS_FILE" ] && fail "Paths file not found: $PATHS_FILE"
+[ ! -r "$PATHS_FILE" ] && fail "Paths file is not readable: $PATHS_FILE"
 
-# Normalize the path - add https prefix if not present
-if [[ ! "$DICOMWEB_PATH" =~ ^https?:// ]]; then
-  HCAPI_HOST=https://healthcare.googleapis.com/v1
-  # Remove leading slash if present
-  DICOMWEB_PATH="${DICOMWEB_PATH#/}"
-  DICOMWEB_HOST="${HCAPI_HOST}/${DICOMWEB_PATH}"
-else
-  DICOMWEB_HOST="$DICOMWEB_PATH"
-fi
+# Read paths into array and normalize them
+DICOMWEB_PATHS=()
+HCAPI_HOST=https://healthcare.googleapis.com/v1
 
-# Auto-detect the level based on the path
-if [[ "$DICOMWEB_HOST" =~ /frames/[^/]+$ ]]; then
+while IFS= read -r line || [ -n "$line" ]; do
+  # Skip empty lines and comments
+  [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+  
+  # Normalize the path - add https prefix if not present
+  if [[ ! "$line" =~ ^https?:// ]]; then
+    # Remove leading slash if present
+    line="${line#/}"
+    line="${HCAPI_HOST}/${line}"
+  fi
+  
+  DICOMWEB_PATHS+=("$line")
+done < "$PATHS_FILE"
+
+# Validate we have paths
+[ ${#DICOMWEB_PATHS[@]} -eq 0 ] && fail "No valid paths found in $PATHS_FILE"
+
+# Auto-detect the level based on the first path (assume all paths are same level)
+FIRST_PATH="${DICOMWEB_PATHS[0]}"
+if [[ "$FIRST_PATH" =~ /frames/[^/]+$ ]]; then
   LEVEL="frame"
-  FRAME_NUMBER=$(echo "$DICOMWEB_HOST" | grep -oP '/frames/\K[^/]+$')
-  INSTANCE_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/instances/\K[^/]+(?=/frames)')
-  SERIES_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/series/\K[^/]+(?=/instances)')
-  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+(?=/series)')
-elif [[ "$DICOMWEB_HOST" =~ /instances/[^/]+$ ]]; then
+elif [[ "$FIRST_PATH" =~ /instances/[^/]+$ ]]; then
   LEVEL="instance"
-  INSTANCE_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/instances/\K[^/]+$')
-  SERIES_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/series/\K[^/]+(?=/instances)')
-  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+(?=/series)')
-elif [[ "$DICOMWEB_HOST" =~ /series/[^/]+$ ]]; then
+elif [[ "$FIRST_PATH" =~ /series/[^/]+$ ]]; then
   LEVEL="series"
-  SERIES_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/series/\K[^/]+$')
-  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+(?=/series)')
-elif [[ "$DICOMWEB_HOST" =~ /studies/[^/]+$ ]]; then
+elif [[ "$FIRST_PATH" =~ /studies/[^/]+$ ]]; then
   LEVEL="study"
-  STUDY_UID=$(echo "$DICOMWEB_HOST" | grep -oP '/studies/\K[^/]+$')
 else
-  fail "Invalid DICOMweb path. Path must end with /studies/<uid>, /series/<uid>, /instances/<uid>, or /frames/<number>"
+  fail "Invalid DICOMweb path format in file. Paths must end with /studies/<uid>, /series/<uid>, /instances/<uid>, or /frames/<number>"
 fi
 
 # Validate that at least one stopping condition is provided
@@ -156,13 +161,29 @@ STOP_FLAG="${TEMP_DIR}/stop"
 # Clean up temp dir on exit
 trap "rm -rf ${TEMP_DIR}" EXIT
 
-echo "=== DICOM Retrieval Performance Test ==="
-echo "DICOMweb URL: ${DICOMWEB_HOST}"
+# Create a file with all paths for workers to consume
+PATHS_QUEUE="${TEMP_DIR}/paths_queue.txt"
+PATHS_INDEX="${TEMP_DIR}/paths_index.txt"
+
+# Write paths with their original indices (0-based)
+for i in "${!DICOMWEB_PATHS[@]}"; do
+  echo "$i|${DICOMWEB_PATHS[$i]}" >> "$PATHS_INDEX"
+done
+
+if [ "$RANDOMIZE" = true ]; then
+  # Shuffle the paths while preserving the index
+  shuf "$PATHS_INDEX" > "$PATHS_QUEUE"
+  echo "=== DICOM Retrieval Performance Test ==="
+  echo "Paths File: ${PATHS_FILE}"
+  echo "Total Paths: ${#DICOMWEB_PATHS[@]} (RANDOMIZED)"
+else
+  cp "$PATHS_INDEX" "$PATHS_QUEUE"
+  echo "=== DICOM Retrieval Performance Test ==="
+  echo "Paths File: ${PATHS_FILE}"
+  echo "Total Paths: ${#DICOMWEB_PATHS[@]}"
+fi
+
 echo "Detected Level: ${LEVEL}"
-echo "Study UID: ${STUDY_UID}"
-[ -n "$SERIES_UID" ] && echo "Series UID: ${SERIES_UID}"
-[ -n "$INSTANCE_UID" ] && echo "Instance UID: ${INSTANCE_UID}"
-[ -n "$FRAME_NUMBER" ] && echo "Frame Number: ${FRAME_NUMBER}"
 echo "Parallel Requests: ${PARALLEL_REQUESTS}"
 [ "$MAX_REQUESTS" -gt 0 ] && echo "Max Requests: ${MAX_REQUESTS}"
 [ "$DURATION_SECONDS" -gt 0 ] && echo "Duration: ${DURATION_SECONDS} seconds"
@@ -173,11 +194,12 @@ echo ""
 do_request() {
   local worker_id=$1
   local bearer_token=$2
-  local dicomweb_host=$3
-  local results_file=$4
-  local stop_flag=$5
-  local verbose=$6
-  local max_retries=$7
+  local path_index=$3
+  local dicomweb_path=$4
+  local results_file=$5
+  local stop_flag=$6
+  local verbose=$7
+  local max_retries=$8
   
   local attempt=0
   local retry_delay=${RETRY_DELAY}
@@ -196,7 +218,7 @@ do_request() {
       --write-out "%{http_code}" \
       --max-time ${REQUEST_TIMEOUT} \
       -H "Authorization: Bearer ${bearer_token}" \
-      "${dicomweb_host}")
+      "${dicomweb_path}")
     
     local attempt_end=$(date +%s%3N)
     local attempt_time=$((attempt_end - attempt_start))
@@ -226,38 +248,57 @@ do_request() {
     sleep $backoff_time
   done
   
-  # Write result (add retry count as third column)
-  echo "${http_result}|${total_time_ms}|${attempt}" >> "$results_file"
+  # Write result: http_code|response_time_ms|retry_count|path_index
+  echo "${http_result}|${total_time_ms}|${attempt}|${path_index}" >> "$results_file"
   
   if [ "$verbose" = true ]; then
     if [ "$http_result" = "200" ]; then
       if [ $attempt -gt 0 ]; then
-        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms (retried $attempt times)"
+        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms (path ${path_index}, retried $attempt times)"
       else
-        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms"
+        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms (path ${path_index})"
       fi
     elif [ "$http_result" = "429" ] && [ $attempt -gt 0 ]; then
-      echo "[Worker $worker_id] ✗ HTTP ${http_result} - ${total_time_ms}ms (FAILED after $attempt retries)"
+      echo "[Worker $worker_id] ✗ HTTP ${http_result} - ${total_time_ms}ms (path ${path_index}, FAILED after $attempt retries)"
     else
-      echo "[Worker $worker_id] ✗ HTTP ${http_result} - ${total_time_ms}ms (FAILED)"
+      echo "[Worker $worker_id] ✗ HTTP ${http_result} - ${total_time_ms}ms (path ${path_index}, FAILED)"
     fi
   fi
   
   return 0
 }
 
-# Worker process
+# Worker process - now picks paths from the queue
 worker() {
   local worker_id=$1
   local bearer_token=$2
-  local dicomweb_host=$3
+  local paths_queue=$3
   local results_file=$4
   local stop_flag=$5
   local verbose=$6
   local max_retries=$7
+  local line_num=0
+  local total_paths=$(wc -l < "$paths_queue")
   
   while [ ! -f "$stop_flag" ]; do
-    do_request "$worker_id" "$bearer_token" "$dicomweb_host" "$results_file" "$stop_flag" "$verbose" "$max_retries"
+    # Get next path (cycle through the list)
+    line_num=$((line_num + 1))
+    if [ $line_num -gt $total_paths ]; then
+      line_num=1
+    fi
+    
+    local line=$(sed -n "${line_num}p" "$paths_queue")
+    
+    # Safety check
+    if [ -z "$line" ]; then
+      continue
+    fi
+    
+    # Parse index and path (format: index|path)
+    local path_index=$(echo "$line" | cut -d'|' -f1)
+    local dicomweb_path=$(echo "$line" | cut -d'|' -f2-)
+    
+    do_request "$worker_id" "$bearer_token" "$path_index" "$dicomweb_path" "$results_file" "$stop_flag" "$verbose" "$max_retries"
   done
 }
 
@@ -265,7 +306,7 @@ worker() {
 # Start workers and track their PIDs
 WORKER_PIDS=()
 for i in $(seq 1 $PARALLEL_REQUESTS); do
-  worker "$i" "$BEARER_TOKEN" "$DICOMWEB_HOST" "$RESULTS_FILE" "$STOP_FLAG" "$VERBOSE" "$MAX_RETRIES" &
+  worker "$i" "$BEARER_TOKEN" "$PATHS_QUEUE" "$RESULTS_FILE" "$STOP_FLAG" "$VERBOSE" "$MAX_RETRIES" &
   WORKER_PIDS+=("$!")
 done
 
@@ -369,6 +410,7 @@ SUCCESS_COUNT=$(grep -c "^200|" "$RESULTS_FILE" || true)
 ERROR_COUNT=$((TOTAL_REQUESTS - SUCCESS_COUNT))
 
 # Count retried requests (any with retry count > 0)
+# Note: Format is now http_code|response_time|retries|path_index
 RETRIED_COUNT=$(awk -F'|' '$3 > 0 {c++} END {print c+0}' "$RESULTS_FILE")
 RETRIED_SUCCESS=$(awk -F'|' '$1=="200" && $3 > 0 {c++} END {print c+0}' "$RESULTS_FILE")
 
@@ -437,27 +479,19 @@ STATS_FILE="${OUTPUT_DIR}/stats_${TIMESTAMP}.txt"
 echo ""
 echo "=== Saving Results ==="
   
-  # Save raw results as CSV
-  echo "timestamp_ms,http_code,response_time_ms" > "$RESULTS_CSV"
-  awk -F'|' '{print NR","$1","$2}' "$RESULTS_FILE" >> "$RESULTS_CSV"
+  # Save raw results as CSV (now with retries and path index)
+  echo "request_num,http_code,response_time_ms,retries,path_index" > "$RESULTS_CSV"
+  awk -F'|' '{print NR","$1","$2","$3","$4}' "$RESULTS_FILE" >> "$RESULTS_CSV"
   echo "Raw results saved to: ${RESULTS_CSV}"
-
-    # Save raw results as CSV (now with retries)
-    echo "timestamp_ms,http_code,response_time_ms,retries" > "$RESULTS_CSV"
-    awk -F'|' '{print NR","$1","$2","$3}' "$RESULTS_FILE" >> "$RESULTS_CSV"
-    echo "Raw results saved to: ${RESULTS_CSV}"
   
   # Save statistics summary
   cat > "$STATS_FILE" << EOF
 DICOM Retrieval Performance Test Results
 ========================================
 Test Date: $(date)
-DICOMweb URL: ${DICOMWEB_HOST}
+Paths File: ${PATHS_FILE}
+Total Paths: ${#DICOMWEB_PATHS[@]}
 Detected Level: ${LEVEL}
-Study UID: ${STUDY_UID}
-$([ -n "$SERIES_UID" ] && echo "Series UID: ${SERIES_UID}")
-$([ -n "$INSTANCE_UID" ] && echo "Instance UID: ${INSTANCE_UID}")
-$([ -n "$FRAME_NUMBER" ] && echo "Frame Number: ${FRAME_NUMBER}")
 Parallel Requests: ${PARALLEL_REQUESTS}
 
 Test Results
@@ -486,6 +520,13 @@ $(if [ "$ERROR_COUNT" -gt 0 ]; then
   echo "==============="
   grep -v "^200|" "$RESULTS_FILE" | cut -d'|' -f1 | sort | uniq -c | while read count code; do
     echo "HTTP ${code}: ${count} occurrences"
+  done
+  
+  # Show which path indices had errors
+  echo ""
+  echo "=== Errors by Path Index ==="
+  grep -v "^200|" "$RESULTS_FILE" | cut -d'|' -f4 | sort -n | uniq -c | sort -rn | head -20 | while read count idx; do
+    echo "Path index ${idx}: ${count} errors"
   done
 fi)
 EOF

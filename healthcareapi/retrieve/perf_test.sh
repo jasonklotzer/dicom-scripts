@@ -205,6 +205,7 @@ do_request() {
   local retry_delay=${RETRY_DELAY}
   local http_result=""
   local total_time_ms=0
+  local bytes_downloaded=0
   
   START_MS=$(date +%s%3N)
   
@@ -212,13 +213,16 @@ do_request() {
     local attempt_start=$(date +%s%3N)
     
     # Perform the retrieval request
-    http_result=$(curl -X GET \
+    curl_output=$(curl -X GET \
       --silent \
       --output /dev/null \
-      --write-out "%{http_code}" \
+      --write-out "%{http_code}|%{size_download}" \
       --max-time ${REQUEST_TIMEOUT} \
       -H "Authorization: Bearer ${bearer_token}" \
       "${dicomweb_path}")
+    
+    http_result=$(echo "$curl_output" | cut -d'|' -f1)
+    bytes_downloaded=$(echo "$curl_output" | cut -d'|' -f2)
     
     local attempt_end=$(date +%s%3N)
     local attempt_time=$((attempt_end - attempt_start))
@@ -248,15 +252,16 @@ do_request() {
     sleep $backoff_time
   done
   
-  # Write result: http_code|response_time_ms|retry_count|path_index
-  echo "${http_result}|${total_time_ms}|${attempt}|${path_index}" >> "$results_file"
+  # Write result: http_code|response_time_ms|retry_count|path_index|bytes_downloaded
+  echo "${http_result}|${total_time_ms}|${attempt}|${path_index}|${bytes_downloaded}" >> "$results_file"
   
   if [ "$verbose" = true ]; then
     if [ "$http_result" = "200" ]; then
+      local kb_size=$(echo "scale=1; $bytes_downloaded / 1024" | bc -l)
       if [ $attempt -gt 0 ]; then
-        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms (path ${path_index}, retried $attempt times)"
+        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms - ${kb_size}KB (path ${path_index}, retried $attempt times)"
       else
-        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms (path ${path_index})"
+        echo "[Worker $worker_id] ✓ HTTP ${http_result} - ${total_time_ms}ms - ${kb_size}KB (path ${path_index})"
       fi
     elif [ "$http_result" = "429" ] && [ $attempt -gt 0 ]; then
       echo "[Worker $worker_id] ✗ HTTP ${http_result} - ${total_time_ms}ms (path ${path_index}, FAILED after $attempt retries)"
@@ -410,7 +415,7 @@ SUCCESS_COUNT=$(grep -c "^200|" "$RESULTS_FILE" || true)
 ERROR_COUNT=$((TOTAL_REQUESTS - SUCCESS_COUNT))
 
 # Count retried requests (any with retry count > 0)
-# Note: Format is now http_code|response_time|retries|path_index
+# Note: Format is now http_code|response_time|retries|path_index|bytes_downloaded
 RETRIED_COUNT=$(awk -F'|' '$3 > 0 {c++} END {print c+0}' "$RESULTS_FILE")
 RETRIED_SUCCESS=$(awk -F'|' '$1=="200" && $3 > 0 {c++} END {print c+0}' "$RESULTS_FILE")
 
@@ -437,10 +442,28 @@ if [ "$SUCCESS_COUNT" -gt 0 ]; then
   P90_TIME=$(echo "$TIMES" | sed -n "${P90_INDEX}p")
 fi
 
+# Calculate data throughput statistics
+TOTAL_BYTES_SUCCESS=0
+if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  TOTAL_BYTES_SUCCESS=$(grep "^200|" "$RESULTS_FILE" | cut -d'|' -f5 | awk '{sum+=$1} END {print sum+0}')
+fi
+
+# Calculate throughput in various units
+if [ "$TOTAL_BYTES_SUCCESS" -gt 0 ] && [ "$TOTAL_TIME" -gt 0 ]; then
+  # Convert bytes to megabits (1 byte = 8 bits, 1 megabit = 1,000,000 bits)
+  THROUGHPUT_MBPS=$(echo "scale=3; ($TOTAL_BYTES_SUCCESS * 8) / ($TOTAL_TIME * 1000000)" | bc -l)
+else
+  THROUGHPUT_MBPS="0.000"
+fi
+
 # Print statistics
 echo "Total Requests: ${TOTAL_REQUESTS}"
 echo "Duration: ${TOTAL_TIME} seconds"
-echo "Throughput: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) requests/second"
+echo "Request Rate: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) requests/second"
+if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  echo "Data Downloaded: $(echo "scale=2; $TOTAL_BYTES_SUCCESS / 1000000" | bc -l) MB (successful requests)"
+  echo "Data Throughput: ${THROUGHPUT_MBPS} Mbits/sec"
+fi
 echo ""
 echo "Success: ${SUCCESS_COUNT} ($(echo "scale=2; ($SUCCESS_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)"
 echo "Errors: ${ERROR_COUNT} ($(echo "scale=2; ($ERROR_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)"
@@ -479,9 +502,9 @@ STATS_FILE="${OUTPUT_DIR}/stats_${TIMESTAMP}.txt"
 echo ""
 echo "=== Saving Results ==="
   
-  # Save raw results as CSV (now with retries and path index)
-  echo "request_num,http_code,response_time_ms,retries,path_index" > "$RESULTS_CSV"
-  awk -F'|' '{print NR","$1","$2","$3","$4}' "$RESULTS_FILE" >> "$RESULTS_CSV"
+  # Save raw results as CSV (now with retries, path index, and bytes downloaded)
+  echo "request_num,http_code,response_time_ms,retries,path_index,bytes_downloaded" > "$RESULTS_CSV"
+  awk -F'|' '{print NR","$1","$2","$3","$4","$5}' "$RESULTS_FILE" >> "$RESULTS_CSV"
   echo "Raw results saved to: ${RESULTS_CSV}"
   
   # Save statistics summary
@@ -498,7 +521,11 @@ Test Results
 ============
 Total Requests: ${TOTAL_REQUESTS}
 Duration: ${TOTAL_TIME} seconds
-Throughput: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) requests/second
+Request Rate: $(echo "scale=2; $TOTAL_REQUESTS / $TOTAL_TIME" | bc -l) requests/second
+$(if [ "$SUCCESS_COUNT" -gt 0 ]; then
+echo "Data Downloaded: $(echo "scale=2; $TOTAL_BYTES_SUCCESS / 1000000" | bc -l) MB (successful requests)"
+echo "Data Throughput: ${THROUGHPUT_MBPS} Mbits/sec"
+fi)
 
 Success: ${SUCCESS_COUNT} ($(echo "scale=2; ($SUCCESS_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)
 Errors: ${ERROR_COUNT} ($(echo "scale=2; ($ERROR_COUNT * 100) / $TOTAL_REQUESTS" | bc -l)%)
@@ -540,10 +567,11 @@ if [ "$GENERATE_GRAPH" = true ]; then
   HISTOGRAM_PNG="${OUTPUT_DIR}/histogram_${TIMESTAMP}.png"
   TIMESERIES_PNG="${OUTPUT_DIR}/timeseries_${TIMESTAMP}.png"
   STATUS_PNG="${OUTPUT_DIR}/status_codes_${TIMESTAMP}.png"
+  THROUGHPUT_PNG="${OUTPUT_DIR}/throughput_${TIMESTAMP}.png"
   COMBINED_PNG="${OUTPUT_DIR}/summary_${TIMESTAMP}.png"
 
-  # Extract all requests with request number, http code, and response time
-  awk -F'|' '{print NR, $1, $2, $3}' "$RESULTS_FILE" > "${TEMP_DIR}/all_requests.dat"
+  # Extract all requests with request number, http code, response time, retries, and bytes
+  awk -F'|' '{print NR, $1, $2, $3, $5}' "$RESULTS_FILE" > "${TEMP_DIR}/all_requests.dat"
 
   # Extract successful and failed requests separately
   if [ "$SUCCESS_COUNT" -gt 0 ]; then
@@ -639,86 +667,51 @@ plot \
 GNUPLOT_TIMESERIES
     
     echo "Time series saved to: ${TIMESERIES_PNG}"
-  fi
-  
-  # Build bottom right plot section
-  BOTTOM_RIGHT_PLOT=""
-  if [ "$SUCCESS_COUNT" -gt 10 ] && [ -s "${TEMP_DIR}/success_times.dat" ]; then
-    # Check if we have enough variation in the data for a meaningful histogram
-    DATA_RANGE=$(awk '{print $2}' "${TEMP_DIR}/success_times.dat" | sort -n | awk 'NR==1{min=$1} {max=$1} END{print max-min}')
-    if [ "$DATA_RANGE" -gt 0 ] 2>/dev/null; then
-      BOTTOM_RIGHT_PLOT="unset label 1
-set tics
-set title \"Response Time Distribution (Successful)\"
-set xlabel \"Response Time (ms)\"
-set ylabel \"Frequency\"
-set grid ytics
-set style fill solid 0.5
-set boxwidth 0.9 relative
-unset key
-stats '${TEMP_DIR}/success_times.dat' using 2 nooutput
-binwidth = (STATS_max - STATS_min) / 20
-if (binwidth <= 0) binwidth = 1
-bin(x,width)=width*floor(x/width)
-plot '${TEMP_DIR}/success_times.dat' using (bin(\$2,binwidth)):(1.0) smooth freq with boxes lc rgb \"blue\""
-    else
-      # Data has no variation
-      BOTTOM_RIGHT_PLOT="unset label 1
-unset label 2
-unset label 3
-unset label 4
-unset label 5
-unset label 6
-unset label 7
-unset label 8
-unset label 9
-unset label 10
-unset label 11
-unset label 12
-set border
-set tics
-set title \"Response Time Distribution\"
-set xlabel \"\"
-set ylabel \"\"
-unset grid
-unset key
-set label 100 \"All response times\\nidentical (${AVG_TIME}ms)\" at screen 0.65, screen 0.15 center font \"Arial,14\"
-plot -1 notitle"
+
+    # Generate throughput over time graph (successful requests only)
+    if [ "$TOTAL_BYTES_SUCCESS" -gt 0 ]; then
+      # First count total successful requests
+      TOTAL_SUCCESS_REQUESTS=$(grep -c "^200|" "$RESULTS_FILE")
+      
+      # Create data file with proper cumulative throughput calculation
+      grep "^200|" "$RESULTS_FILE" | awk -F'|' -v total_time="$TOTAL_TIME" -v total_success="$TOTAL_SUCCESS_REQUESTS" '
+      BEGIN {
+        cumulative_bytes = 0
+        request_count = 0
+      }
+      {
+        request_count++
+        cumulative_bytes += $5
+        # Estimate elapsed time based on request progress through the test
+        elapsed_time = (request_count / total_success) * total_time
+        if (elapsed_time > 0) {
+          # Calculate cumulative throughput in Mbits/sec
+          cumulative_throughput_mbps = (cumulative_bytes * 8) / (elapsed_time * 1000000)
+          print request_count, cumulative_throughput_mbps, cumulative_bytes/1000000
+        }
+      }' > "${TEMP_DIR}/throughput_data.dat"
+
+      if [ -s "${TEMP_DIR}/throughput_data.dat" ]; then
+        gnuplot 2>/dev/null << GNUPLOT_THROUGHPUT
+set terminal png size 1200,600 font "Arial,12"
+set output '${THROUGHPUT_PNG}'
+set title "Data Throughput Over Test Duration\n${LEVEL} level - Average: ${THROUGHPUT_MBPS} Mbits/sec"
+set xlabel "Request Number"
+set ylabel "Throughput (Mbits/sec)"
+set y2label "Cumulative Data (MB)"
+set grid
+set key top left
+set y2tics
+set ytics nomirror
+
+plot '${TEMP_DIR}/throughput_data.dat' using 1:2 with lines lc rgb "blue" lw 2 title "Cumulative Throughput (Mbits/sec)" axes x1y1, \\
+     '${TEMP_DIR}/throughput_data.dat' using 1:3 with lines lc rgb "red" lw 2 title "Cumulative Data (MB)" axes x1y2, \\
+     ${THROUGHPUT_MBPS} with lines lc rgb "green" lw 2 dt 2 title "Overall Average (${THROUGHPUT_MBPS} Mbits/sec)" axes x1y1
+GNUPLOT_THROUGHPUT
+        echo "Throughput graph saved to: ${THROUGHPUT_PNG}"
+      fi
     fi
-  else
-    BOTTOM_RIGHT_PLOT="unset label 1
-unset label 2
-unset label 3
-unset label 4
-unset label 5
-unset label 6
-unset label 7
-unset label 8
-unset label 9
-unset label 10
-unset label 11
-unset label 12
-set border
-set tics
-set title \"Insufficient Data\"
-set xlabel \"\"
-set ylabel \"\"
-unset grid
-unset key
-set label 100 \"Not enough successful\\nrequests for distribution\" at screen 0.65, screen 0.15 center font \"Arial,14\"
-plot -1 notitle"
   fi
-
-  # Build success labels
-  SUCCESS_LABELS=""
-  if [ "$SUCCESS_COUNT" -gt 0 ]; then
-    SUCCESS_LABELS="set label 8 \"Response Times (Successful)\" at screen 0.15, screen 0.20 font \"Arial,12\"
-set label 9 sprintf(\"Min: %d ms\", ${MIN_TIME}) at screen 0.15, screen 0.16
-set label 10 sprintf(\"Avg: %d ms\", ${AVG_TIME}) at screen 0.15, screen 0.13
-set label 11 sprintf(\"P90: %d ms\", ${P90_TIME}) at screen 0.15, screen 0.10
-set label 12 sprintf(\"Max: %d ms\", ${MAX_TIME}) at screen 0.15, screen 0.07"
-  fi
-
   # Build time series plot lines
   TIMESERIES_EXTRA=""
   if [ "$SUCCESS_COUNT" -gt 0 ]; then
@@ -727,11 +720,14 @@ set label 12 sprintf(\"Max: %d ms\", ${MAX_TIME}) at screen 0.15, screen 0.07"
      ${P90_TIME} with lines lc rgb \"orange\" lw 2 title \"P90\""
   fi
 
-  # Generate combined summary graph
-  gnuplot 2>/dev/null << GNUPLOT_COMBINED
-set terminal png size 1600,1200 font "Arial,12"
+  # Generate combined summary graph with all relevant plots
+  # Create the gnuplot script dynamically
+  GNUPLOT_SCRIPT="${TEMP_DIR}/combined_plot.gp"
+  
+  cat > "$GNUPLOT_SCRIPT" << EOF
+set terminal png size 1800,1200 font "Arial,11"
 set output '${COMBINED_PNG}'
-set multiplot layout 2,2 title "Performance Test Summary - ${LEVEL} Level\\nSuccess: ${SUCCESS_COUNT} | Failures: ${ERROR_COUNT}" font "Arial,14"
+set multiplot layout 2,3 title "Performance Test Summary - ${LEVEL} Level\\nSuccess: ${SUCCESS_COUNT} | Failures: ${ERROR_COUNT} | Throughput: ${THROUGHPUT_MBPS} Mbits/sec" font "Arial,14"
 
 # Top left: Time series with success/failure
 set title "Response Time Over Test Duration"
@@ -742,7 +738,7 @@ set key top left
 plot '${TEMP_DIR}/all_requests.dat' using (\$2==200?\$1:1/0):3 with points pt 7 ps 0.5 lc rgb "blue" title "Success", \\
      '${TEMP_DIR}/all_requests.dat' using (\$2!=200?\$1:1/0):3 with points pt 5 ps 0.8 lc rgb "red" title "Failed"${TIMESERIES_EXTRA}
 
-# Top right: HTTP Status Code Distribution
+# Top middle: HTTP Status Code Distribution
 set title "HTTP Status Code Distribution"
 set xlabel "Status Code"
 set ylabel "Count"
@@ -753,28 +749,236 @@ unset key
 set style data histogram
 plot '< awk -F"|" "{print \\\$1}" ${RESULTS_FILE} | sort | uniq -c | awk "{print \\\$2, \\\$1}"' using 2:xtic(1) with boxes lc rgb "blue"
 
+# Top right: Throughput over time
+EOF
+
+  # Add throughput plot section dynamically
+  if [ "$TOTAL_BYTES_SUCCESS" -gt 0 ] && [ -s "${TEMP_DIR}/throughput_data.dat" ]; then
+    cat >> "$GNUPLOT_SCRIPT" << EOF
+set title "Data Throughput Over Time"
+set xlabel "Request Number"
+set ylabel "Throughput (Mbits/sec)"
+set y2label "Cumulative Data (MB)"
+set grid
+set key top left
+set y2tics
+set ytics nomirror
+plot '${TEMP_DIR}/throughput_data.dat' using 1:2 with lines lc rgb "blue" lw 2 title "Cumulative Throughput" axes x1y1, \\
+     '${TEMP_DIR}/throughput_data.dat' using 1:3 with lines lc rgb "red" lw 2 title "Cumulative Data (MB)" axes x1y2, \\
+     ${THROUGHPUT_MBPS} with lines lc rgb "green" lw 2 dt 2 title "Average" axes x1y1
+EOF
+  else
+    cat >> "$GNUPLOT_SCRIPT" << EOF
+unset xlabel
+unset ylabel
+unset border
+unset tics
+unset key
+unset y2tics
+unset y2label
+set xrange [0:1]
+set yrange [0:1]
+set title "Throughput Data"
+set label 101 "No throughput data\\navailable" at graph 0.5,0.5 center font "Arial,14"
+plot -1 notitle
+EOF
+  fi
+
+  
+  # Add bottom left section (statistics)
+  cat >> "$GNUPLOT_SCRIPT" << EOF
+
 # Bottom left: Statistics summary (text)
 unset xlabel
 unset ylabel
 unset border
 unset tics
-set key off
+unset key
+unset y2tics
+unset y2label
 set xrange [0:1]
 set yrange [0:1]
-set label 1 "Test Statistics" at screen 0.15, screen 0.45 font "Arial,14"
-set label 2 sprintf("Total Requests: %d", ${TOTAL_REQUESTS}) at screen 0.15, screen 0.40
-set label 3 sprintf("Success Rate: %.1f%%", (${SUCCESS_COUNT}*100.0/${TOTAL_REQUESTS})) at screen 0.15, screen 0.37
-set label 4 sprintf("Failed Requests: %d", ${ERROR_COUNT}) at screen 0.15, screen 0.34
-set label 5 sprintf("Duration: %d seconds", ${TOTAL_TIME}) at screen 0.15, screen 0.31
-set label 6 sprintf("Throughput: %.2f req/s", ${TOTAL_REQUESTS}/${TOTAL_TIME}) at screen 0.15, screen 0.28
-set label 7 sprintf("Parallel Workers: %d", ${PARALLEL_REQUESTS}) at screen 0.15, screen 0.25
-${SUCCESS_LABELS}
+set label 1 "Test Statistics" at screen 0.05, screen 0.45 font "Arial,12"
+set label 2 sprintf("Total Requests: %d", ${TOTAL_REQUESTS}) at screen 0.05, screen 0.41
+set label 3 sprintf("Success Rate: %.1f%%", (${SUCCESS_COUNT}*100.0/${TOTAL_REQUESTS})) at screen 0.05, screen 0.38
+set label 4 sprintf("Failed Requests: %d", ${ERROR_COUNT}) at screen 0.05, screen 0.35
+set label 5 sprintf("Duration: %d seconds", ${TOTAL_TIME}) at screen 0.05, screen 0.32
+set label 6 sprintf("Request Rate: %.2f req/s", ${TOTAL_REQUESTS}/${TOTAL_TIME}) at screen 0.05, screen 0.29
+set label 7 sprintf("Parallel Workers: %d", ${PARALLEL_REQUESTS}) at screen 0.05, screen 0.26
+EOF
+
+  # Add response time labels if we have successful requests
+  if [ "$SUCCESS_COUNT" -gt 0 ]; then
+    cat >> "$GNUPLOT_SCRIPT" << EOF
+set label 8 "Response Times" at screen 0.05, screen 0.22 font "Arial,12"
+set label 9 sprintf("Min: %d ms", ${MIN_TIME}) at screen 0.05, screen 0.19
+set label 10 sprintf("Avg: %d ms", ${AVG_TIME}) at screen 0.05, screen 0.16
+set label 11 sprintf("P90: %d ms", ${P90_TIME}) at screen 0.05, screen 0.13
+set label 12 sprintf("Max: %d ms", ${MAX_TIME}) at screen 0.05, screen 0.10
+EOF
+  fi
+
+  # Add throughput labels if we have data
+  if [ "$TOTAL_BYTES_SUCCESS" -gt 0 ]; then
+    MB_DOWNLOADED=$(echo "scale=2; $TOTAL_BYTES_SUCCESS / 1000000" | bc -l)
+    cat >> "$GNUPLOT_SCRIPT" << EOF
+set label 13 "Data Transfer" at screen 0.05, screen 0.06 font "Arial,12"
+set label 14 sprintf("%.2f MB downloaded", ${MB_DOWNLOADED}) at screen 0.05, screen 0.03
+set label 15 sprintf("${THROUGHPUT_MBPS} Mbits/sec") at screen 0.05, screen 0.00
+EOF
+  fi
+
+  cat >> "$GNUPLOT_SCRIPT" << EOF
 plot -1 notitle
 
-# Bottom right: Response time histogram (successful only) or placeholder
-${BOTTOM_RIGHT_PLOT}
+# Bottom middle: Response time histogram
+EOF
+
+  # Add histogram section dynamically
+  if [ "$SUCCESS_COUNT" -gt 10 ] && [ -s "${TEMP_DIR}/success_times.dat" ]; then
+    DATA_RANGE=$(awk '{print $2}' "${TEMP_DIR}/success_times.dat" | sort -n | awk 'NR==1{min=$1} {max=$1} END{print max-min}')
+    if [ "$DATA_RANGE" -gt 0 ] 2>/dev/null; then
+      cat >> "$GNUPLOT_SCRIPT" << EOF
+unset label 1
+unset label 2
+unset label 3
+unset label 4
+unset label 5
+unset label 6
+unset label 7
+unset label 8
+unset label 9
+unset label 10
+unset label 11
+unset label 12
+unset label 13
+unset label 14
+unset label 15
+unset label 101
+set border
+set tics
+set title "Response Time Distribution"
+set xlabel "Response Time (ms)"
+set ylabel "Frequency"
+set grid ytics
+set style fill solid 0.5
+set boxwidth 0.9 relative
+unset key
+stats '${TEMP_DIR}/success_times.dat' using 2 nooutput
+binwidth = (STATS_max - STATS_min) / 20
+if (binwidth <= 0) binwidth = 1
+bin(x,width)=width*floor(x/width)
+plot '${TEMP_DIR}/success_times.dat' using (bin(\$2,binwidth)):(1.0) smooth freq with boxes lc rgb "blue"
+EOF
+    else
+      cat >> "$GNUPLOT_SCRIPT" << EOF
+unset label 1
+unset label 2
+unset label 3
+unset label 4
+unset label 5
+unset label 6
+unset label 7
+unset label 8
+unset label 9
+unset label 10
+unset label 11
+unset label 12
+unset label 13
+unset label 14
+unset label 15
+unset label 101
+set border
+set tics
+set title "Response Time Distribution"
+set xlabel ""
+set ylabel ""
+unset grid
+unset key
+set label 102 "All response times\\nidentical (${AVG_TIME}ms)" at graph 0.5, 0.5 center font "Arial,12"
+plot -1 notitle
+EOF
+    fi
+  else
+    cat >> "$GNUPLOT_SCRIPT" << EOF
+unset label 1
+unset label 2
+unset label 3
+unset label 4
+unset label 5
+unset label 6
+unset label 7
+unset label 8
+unset label 9
+unset label 10
+unset label 11
+unset label 12
+unset label 13
+unset label 14
+unset label 15
+unset label 101
+set border
+set tics
+set title "Response Time Distribution"
+set xlabel ""
+set ylabel ""
+unset grid
+unset key
+set label 102 "Not enough successful\\nrequests for distribution" at graph 0.5, 0.5 center font "Arial,12"
+plot -1 notitle
+EOF
+  fi
+
+  # Add error summary section
+  cat >> "$GNUPLOT_SCRIPT" << EOF
+
+# Bottom right: Error breakdown
+unset label 1
+unset label 2
+unset label 3
+unset label 4
+unset label 5
+unset label 6
+unset label 7
+unset label 8
+unset label 9
+unset label 10
+unset label 11
+unset label 12
+unset label 13
+unset label 14
+unset label 15
+unset label 101
+unset label 102
+unset border
+unset tics
+set title "Error Summary"
+set xlabel ""
+set ylabel ""
+unset grid
+unset key
+set xrange [0:1]
+set yrange [0:1]
+EOF
+
+  # Add error labels dynamically
+  if [ "$ERROR_COUNT" -gt 0 ]; then
+    echo 'set label 200 "Error Breakdown" at graph 0.1, 0.9 font "Arial,12"' >> "$GNUPLOT_SCRIPT"
+    grep -v "^200|" "$RESULTS_FILE" | cut -d'|' -f1 | sort | uniq -c | head -5 | awk '{
+      y_pos = 0.8 - (NR * 0.1)
+      printf "set label %d \"HTTP %s: %d errors\" at graph 0.1, %.2f font \"Arial,11\"\n", 200 + NR, $2, $1, y_pos
+    }' >> "$GNUPLOT_SCRIPT"
+  else
+    echo 'set label 200 "No Errors" at graph 0.5, 0.5 center font "Arial,14" tc rgb "green"' >> "$GNUPLOT_SCRIPT"
+  fi
+
+  cat >> "$GNUPLOT_SCRIPT" << EOF
+plot -1 notitle
 unset multiplot
-GNUPLOT_COMBINED
+EOF
+
+  # Execute the gnuplot script
+  gnuplot "$GNUPLOT_SCRIPT" 2>/dev/null
   
   echo "Combined summary saved to: ${COMBINED_PNG}"
   echo ""

@@ -10,6 +10,56 @@ fail() {
   exit 1
 }
 
+show_help() {
+  cat << EOF
+Usage: $0 [OPTIONS] <dicomStorePath> <studyFolder>
+
+Insert all DICOM files from a folder into a Google Cloud Healthcare API DICOM store.
+
+ARGUMENTS:
+  <dicomStorePath>    The path to the DICOM store in the format:
+                      projects/PROJECT_ID/locations/LOCATION/datasets/DATASET_ID/dicomStores/DICOM_STORE_ID
+  <studyFolder>       Path to the folder containing DICOM files (.dcm) to upload
+
+OPTIONS:
+  -s, --single-study  Process only a single study (uses first DICOM file's StudyInstanceUID)
+  -d, --skip-delete   Skip deletion of existing studies before inserting new ones
+  -p, --max-procs <N> Maximum number of parallel processes (default: 50)
+  -h, --help          Show this help message and exit
+
+EXAMPLES:
+  # Basic usage - insert all studies from folder
+  $0 projects/my-project/locations/us-central1/datasets/my-dataset/dicomStores/my-store /path/to/dicom/folder
+
+  # Insert single study only, skip deletion, use 20 parallel processes
+  $0 -s -d -p 20 projects/my-project/locations/us-central1/datasets/my-dataset/dicomStores/my-store /path/to/dicom/folder
+
+  # Show help
+  $0 --help
+
+REQUIREMENTS:
+  - gcloud CLI tool must be installed and authenticated
+  - jq command must be available for JSON processing
+  - curl command must be available
+  - dcm2bq tool must be available (for StudyInstanceUID extraction, unless --skip-delete is used)
+  - Google Cloud Healthcare API must be enabled in your project
+
+BEHAVIOR:
+  1. By default, extracts all unique StudyInstanceUIDs from DICOM files in the folder
+  2. Deletes existing studies with matching UIDs (unless --skip-delete is specified)
+  3. Waits for deletion operations to complete
+  4. Ingests all DICOM files using POST method with v1 API endpoint
+  5. Outputs response statistics and HTTP codes
+
+NOTES:
+  - Uses POST method with v1 API endpoint
+  - Automatically handles 429 (rate limit) errors with retries
+  - Processes files in parallel for better performance
+  - Creates errcodes.json file with response details
+  - Requires valid authentication via gcloud auth application-default login
+EOF
+}
+
 reqCmdExists() {
   command -v $1 >/dev/null 2>&1 || { fail "Command '$1' is required, but not installed."; }
 }
@@ -29,10 +79,14 @@ waitDeleteStudy() {
 }
 
 for COMMAND in $REQ_COMMANDS; do reqCmdExists $COMMAND; done
-[ $# -lt 2 ] && { fail "Usage: $0 [-s|--single-study] [-d|--skip-delete] [-p|--max-procs <numberOfThreads>] <dicomStorePath> <studyFolder>"; }
+[ $# -lt 2 ] && { fail "Usage: $0 [-s|--single-study] [-d|--skip-delete] [-p|--max-procs <numberOfThreads>] <dicomStorePath> <studyFolder> (use --help for more information)"; }
 
 while :; do
   case $1 in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
     -s|--single-study) SINGLE_STUDY=1
     ;;
     -d|--skip-delete) SKIP_DELETE=1

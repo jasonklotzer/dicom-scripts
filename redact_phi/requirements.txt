@@ -1,0 +1,5 @@
+opencv-python>=4.0.0
+pydicom>=2.0.0
+numpy>=1.15.0
+paddlepaddle>=2.4.0
+paddleocr>=2.7.0

@@ -1,3 +1,6 @@
 resp
 dicom_studies_output
 output
+.venv
+files
+instances.txt

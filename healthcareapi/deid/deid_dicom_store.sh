@@ -21,18 +21,19 @@ reqCmdExists() {
 usage() {
   cat << EOF
 Usage: $0 -s <sourceStore> -d <destStore> [options]
+       $0 --source <sourceStore> --destination <destStore> [options]
 
 Required arguments:
-  -s <sourceStore>       Source DICOM store path
-                         Format: projects/PROJECT_ID/locations/LOCATION/datasets/DATASET_ID/dicomStores/SOURCE_STORE
-  -d <destStore>         Destination DICOM store path (must already exist)
-                         Format: projects/PROJECT_ID/locations/LOCATION/datasets/DATASET_ID/dicomStores/DEST_STORE
+  -s, --source <sourceStore>       Source DICOM store path
+                                   Format: projects/PROJECT_ID/locations/LOCATION/datasets/DATASET_ID/dicomStores/SOURCE_STORE
+  -d, --destination <destStore>    Destination DICOM store path (must already exist)
+                                   Format: projects/PROJECT_ID/locations/LOCATION/datasets/DATASET_ID/dicomStores/DEST_STORE
 
 Options:
-  -v                     Verbose output (show API responses and progress)
-  -n                     No-wait mode (don't wait for operation to complete)
-  -i <seconds>           Poll interval when waiting for completion (default: 30)
-  -h                     Show this help message
+  -v, --verbose                    Verbose output (show API responses and progress)
+  -n, --no-wait                    No-wait mode (don't wait for operation to complete)
+  -i, --interval <seconds>         Poll interval when waiting for completion (default: 30)
+  -h, --help                       Show this help message
 
 De-identification Configuration:
   This script uses the following built-in configuration:
@@ -40,33 +41,59 @@ De-identification Configuration:
   - TextRedactionMode: REDACT_SENSITIVE_TEXT_CLEAN_DESCRIPTORS
 
 Examples:
-  # Basic de-identification
+  # Basic de-identification (short options)
   $0 -s projects/my-project/locations/us-central1/datasets/source-ds/dicomStores/original \\
      -d projects/my-project/locations/us-central1/datasets/dest-ds/dicomStores/deidentified
+
+  # Basic de-identification (long options)
+  $0 --source projects/my-project/locations/us-central1/datasets/source-ds/dicomStores/original \\
+     --destination projects/my-project/locations/us-central1/datasets/dest-ds/dicomStores/deidentified
 
   # With verbose output and custom poll interval
   $0 -s projects/my-project/locations/us-central1/datasets/source-ds/dicomStores/original \\
      -d projects/my-project/locations/us-central1/datasets/dest-ds/dicomStores/deidentified \\
-     -v -i 10
+     --verbose --interval 10
 
   # Start operation but don't wait for completion
-  $0 -s projects/my-project/locations/us-central1/datasets/source-ds/dicomStores/original \\
-     -d projects/my-project/locations/us-central1/datasets/dest-ds/dicomStores/deidentified \\
-     -n
+  $0 --source projects/my-project/locations/us-central1/datasets/source-ds/dicomStores/original \\
+     --destination projects/my-project/locations/us-central1/datasets/dest-ds/dicomStores/deidentified \\
+     --no-wait
 EOF
   exit 0
 }
 
 # Parse command line arguments
-while getopts "s:d:vi:nh" opt; do
-  case $opt in
-    s) SOURCE_STORE="$OPTARG" ;;
-    d) DEST_STORE="$OPTARG" ;;
-    v) VERBOSE=true ;;
-    n) WAIT_FOR_COMPLETION=false ;;
-    i) POLL_INTERVAL="$OPTARG" ;;
-    h) usage ;;
-    \?) fail "Invalid option: -$OPTARG" ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--source)
+      SOURCE_STORE="$2"
+      shift 2
+      ;;
+    -d|--destination|--dest)
+      DEST_STORE="$2"
+      shift 2
+      ;;
+    -v|--verbose)
+      VERBOSE=true
+      shift
+      ;;
+    -n|--no-wait)
+      WAIT_FOR_COMPLETION=false
+      shift
+      ;;
+    -i|--interval)
+      POLL_INTERVAL="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      ;;
+    -*)
+      fail "Invalid option: $1. Use -h for help."
+      ;;
+    *)
+      fail "Unexpected argument: $1. Use -h for help."
+      ;;
   esac
 done
 

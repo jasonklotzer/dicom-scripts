@@ -840,83 +840,83 @@ if __name__ == "__main__":
                 else:
                     ds.SeriesDate = study_date
                     ds.SeriesTime = first_instance_time_str
-            if chosen_modality_for_images in ["CT", "MR"]:
-                slice_pos = instance_num * 5.0 + random.uniform(-1.0, 1.0)
-                ds.SliceLocation = f"{slice_pos:.2f}"
-                ds.SliceThickness = "5.0"
-                ds.PixelSpacing = ["0.8", "0.8"]
-                ds.WindowCenter = "40"
-                ds.WindowWidth = "400"
-            elif chosen_modality_for_images in ["CR", "XA", "US"]:
-                try:
-                    center = (1 << (ds.BitsStored - 1))
-                    width = (1 << ds.BitsStored)
-                    ds.WindowCenter = f"{center:.0f}"
-                    ds.WindowWidth = f"{width:.0f}"
-                except AttributeError:
-                    pass
-            if args.generate_pixels:
-                try:
-                    ds.PixelData = generate_plausible_pixel_data(ds, instance_num, quiet=args.quiet)
-                except Exception as pix_err:
-                    print(f"    ***ERROR*** generating pixel data for Instance {instance_num}: {pix_err}", file=sys.stderr)
+                if chosen_modality_for_images in ["CT", "MR"]:
+                    slice_pos = instance_num * 5.0 + random.uniform(-1.0, 1.0)
+                    ds.SliceLocation = f"{slice_pos:.2f}"
+                    ds.SliceThickness = "5.0"
+                    ds.PixelSpacing = ["0.8", "0.8"]
+                    ds.WindowCenter = "40"
+                    ds.WindowWidth = "400"
+                elif chosen_modality_for_images in ["CR", "XA", "US"]:
+                    try:
+                        center = (1 << (ds.BitsStored - 1))
+                        width = (1 << ds.BitsStored)
+                        ds.WindowCenter = f"{center:.0f}"
+                        ds.WindowWidth = f"{width:.0f}"
+                    except AttributeError:
+                        pass
+                if args.generate_pixels:
+                    try:
+                        ds.PixelData = generate_plausible_pixel_data(ds, instance_num, quiet=args.quiet)
+                    except Exception as pix_err:
+                        print(f"    ***ERROR*** generating pixel data for Instance {instance_num}: {pix_err}", file=sys.stderr)
+                        try:
+                            expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                            ds.PixelData = b'\x00' * expected_bytes
+                            if not args.quiet:
+                                print(f"    Falling back to zero bytes for PixelData.")
+                        except AttributeError:
+                            print(f"    ***WARNING*** Cannot calculate fallback zero bytes - missing attributes. PixelData will be empty.", file=sys.stderr)
+                            ds.PixelData = b''
+                else:
+                    if not args.quiet:
+                        print(f"    Skipping plausible pixel generation for Instance {instance_num}. Setting zero bytes.")
                     try:
                         expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
                         ds.PixelData = b'\x00' * expected_bytes
-                        if not args.quiet:
-                            print(f"    Falling back to zero bytes for PixelData.")
                     except AttributeError:
-                        print(f"    ***WARNING*** Cannot calculate fallback zero bytes - missing attributes. PixelData will be empty.", file=sys.stderr)
+                        print(f"    ***WARNING*** Instance {instance_num}: Could not calculate expected bytes for zero pixel data. PixelData may be missing.", file=sys.stderr)
                         ds.PixelData = b''
-            else:
-                if not args.quiet:
-                    print(f"    Skipping plausible pixel generation for Instance {instance_num}. Setting zero bytes.")
+                apply_overrides(ds, overrides_dict, quiet=args.quiet)
+                ds.SOPInstanceUID = ds.SOPInstanceUID
+                ds.SOPClassUID = imaging_sop_class_uid
+                ds.Modality = chosen_modality_for_images
+                if not hasattr(ds, 'SpecificCharacterSet') or not ds.SpecificCharacterSet:
+                    if not args.quiet:
+                        print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) after overrides.")
+                    ds.SpecificCharacterSet = DEFAULT_CHARACTER_SET
                 try:
-                    expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
-                    ds.PixelData = b'\x00' * expected_bytes
-                except AttributeError:
-                    print(f"    ***WARNING*** Instance {instance_num}: Could not calculate expected bytes for zero pixel data. PixelData may be missing.", file=sys.stderr)
-                    ds.PixelData = b''
-            apply_overrides(ds, overrides_dict, quiet=args.quiet)
-            ds.SOPInstanceUID = ds.SOPInstanceUID
-            ds.SOPClassUID = imaging_sop_class_uid
-            ds.Modality = chosen_modality_for_images
-            if not hasattr(ds, 'SpecificCharacterSet') or not ds.SpecificCharacterSet:
-                if not args.quiet:
-                    print(f"    Applying default SpecificCharacterSet ({DEFAULT_CHARACTER_SET}) after overrides.")
-                ds.SpecificCharacterSet = DEFAULT_CHARACTER_SET
-            try:
-                if all(hasattr(ds, attr) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
-                    if not all(isinstance(getattr(ds, attr), (int, float)) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
-                        raise TypeError("Pixel dimension attributes are not numeric")
-                    expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
-                    if hasattr(ds, 'PixelData') and ds.PixelData is not None:
-                        if len(ds.PixelData) != expected_bytes:
-                            print(f"    ***WARNING*** Instance {instance_num}: PixelData length mismatch after overrides!", file=sys.stderr)
-                            print(f"    Expected {expected_bytes}, got {len(ds.PixelData)}. Reverting to zero bytes.", file=sys.stderr)
+                    if all(hasattr(ds, attr) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
+                        if not all(isinstance(getattr(ds, attr), (int, float)) for attr in ['Rows', 'Columns', 'BitsAllocated', 'SamplesPerPixel']):
+                            raise TypeError("Pixel dimension attributes are not numeric")
+                        expected_bytes = ds.Rows * ds.Columns * (ds.BitsAllocated // 8) * ds.SamplesPerPixel
+                        if hasattr(ds, 'PixelData') and ds.PixelData is not None:
+                            if len(ds.PixelData) != expected_bytes:
+                                print(f"    ***WARNING*** Instance {instance_num}: PixelData length mismatch after overrides!", file=sys.stderr)
+                                print(f"    Expected {expected_bytes}, got {len(ds.PixelData)}. Reverting to zero bytes.", file=sys.stderr)
+                                ds.PixelData = b'\x00' * expected_bytes
+                        else:
+                            if not args.quiet:
+                                print(f"    PixelData missing or None after overrides for Instance {instance_num}. Setting zero bytes.")
                             ds.PixelData = b'\x00' * expected_bytes
-                    else:
-                        if not args.quiet:
-                            print(f"    PixelData missing or None after overrides for Instance {instance_num}. Setting zero bytes.")
-                        ds.PixelData = b'\x00' * expected_bytes
-                elif hasattr(ds, 'PixelData') and ds.PixelData:
-                    print(f"    ***WARNING*** Instance {instance_num}: Cannot verify PixelData length due to missing dimension attributes after overrides.", file=sys.stderr)
-            except (AttributeError, TypeError) as len_check_err:
-                print(f"    ***WARNING*** Instance {instance_num}: Error during PixelData length check: {len_check_err}. PixelData might be inconsistent.", file=sys.stderr)
-            file_meta = create_file_meta()
-            file_meta.MediaStorageSOPClassUID = imaging_sop_class_uid
-            file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
-            file_ds = pydicom.FileDataset(
-                filename_or_obj=None, dataset=ds, file_meta=file_meta, preamble=b"\0" * 128
-            )
-            filename = study_output_path / f"{ds.Modality}_{ds.SOPInstanceUID}.dcm"
-            if not args.quiet:
-                bpe_info = f" (BPE: {ds.BodyPartExamined})" if hasattr(ds, "BodyPartExamined") and ds.BodyPartExamined else ""
-                print(f"    Saving: {filename.name}{bpe_info}")
-            try:
-                file_ds.save_as(filename, write_like_original=False)
-            except Exception as e:
-                print(f"    ***ERROR*** Failed to save file {filename.name}: {e}", file=sys.stderr)
+                    elif hasattr(ds, 'PixelData') and ds.PixelData:
+                        print(f"    ***WARNING*** Instance {instance_num}: Cannot verify PixelData length due to missing dimension attributes after overrides.", file=sys.stderr)
+                except (AttributeError, TypeError) as len_check_err:
+                    print(f"    ***WARNING*** Instance {instance_num}: Error during PixelData length check: {len_check_err}. PixelData might be inconsistent.", file=sys.stderr)
+                file_meta = create_file_meta()
+                file_meta.MediaStorageSOPClassUID = imaging_sop_class_uid
+                file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+                file_ds = pydicom.FileDataset(
+                    filename_or_obj=None, dataset=ds, file_meta=file_meta, preamble=b"\0" * 128
+                )
+                filename = study_output_path / f"{ds.Modality}_{ds.SOPInstanceUID}.dcm"
+                if not args.quiet:
+                    bpe_info = f" (BPE: {ds.BodyPartExamined})" if hasattr(ds, "BodyPartExamined") and ds.BodyPartExamined else ""
+                    print(f"    Saving: {filename.name}{bpe_info}")
+                try:
+                    file_ds.save_as(filename, write_like_original=False)
+                except Exception as e:
+                    print(f"    ***ERROR*** Failed to save file {filename.name}: {e}", file=sys.stderr)
         if not args.quiet:
             print(f"Finished generating {NUM_IMAGES} image objects.")
             print("-" * 30)
